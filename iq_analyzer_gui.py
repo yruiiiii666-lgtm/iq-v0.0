@@ -774,6 +774,37 @@ class IQAnalyzerApp(tk.Tk):
             ],
             foreground=[("disabled", "#f4f6f8"), ("!disabled", "#ffffff")],
         )
+        semantic_buttons = {
+            "Teal.TButton": ("#0f766e", "#0d665f", "#0b544f"),
+            "Success.TButton": ("#15803d", "#166534", "#14532d"),
+            "Warning.TButton": ("#d97706", "#b45309", "#92400e"),
+            "Danger.TButton": (colors["danger"], "#a8323d", "#842631"),
+        }
+        for style_name, (normal, active, pressed) in semantic_buttons.items():
+            style.configure(
+                style_name,
+                background=normal,
+                foreground="#ffffff",
+                bordercolor=normal,
+                lightcolor=normal,
+                darkcolor=pressed,
+                font=("Segoe UI", 11, "bold"),
+                padding=(9, 2),
+            )
+            style.map(
+                style_name,
+                background=[
+                    ("disabled", colors["border"]),
+                    ("pressed", pressed),
+                    ("active", active),
+                ],
+                bordercolor=[
+                    ("disabled", colors["border"]),
+                    ("pressed", pressed),
+                    ("active", active),
+                ],
+                foreground=[("disabled", "#f4f6f8"), ("!disabled", "#ffffff")],
+            )
 
         style.configure(
             "TEntry",

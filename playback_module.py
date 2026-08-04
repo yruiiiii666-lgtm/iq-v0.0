@@ -569,20 +569,41 @@ class PlaybackModule(ttk.Frame):
         self.action_buttons = ttk.Frame(parent, style="Panel.TFrame")
         self.action_buttons.grid(row=0, column=0, sticky="w")
         self.prepare_button = ttk.Button(
-            self.action_buttons, text="生成设备波形包", command=self.prepare_package
+            self.action_buttons,
+            text="生成设备波形包",
+            style="Accent.TButton",
+            command=self.prepare_package,
         )
         self.prepare_button.pack(side=tk.LEFT, padx=(0, 5))
         self.send_button = ttk.Button(
-            self.action_buttons, text="发送并配置设备", command=self.send_and_configure, state=tk.DISABLED
+            self.action_buttons,
+            text="发送并配置设备",
+            style="Teal.TButton",
+            command=self.send_and_configure,
+            state=tk.DISABLED,
         )
         self.send_button.pack(side=tk.LEFT, padx=5)
-        ttk.Button(
-            self.action_buttons, text="开始回放", style="Accent.TButton", command=self.start_playback
-        ).pack(
-            side=tk.LEFT, padx=5
+        self.start_button = ttk.Button(
+            self.action_buttons,
+            text="开始回放",
+            style="Success.TButton",
+            command=self.start_playback,
         )
-        ttk.Button(self.action_buttons, text="暂停", command=self.pause_playback).pack(side=tk.LEFT, padx=5)
-        ttk.Button(self.action_buttons, text="停止", command=self.stop_playback).pack(side=tk.LEFT, padx=5)
+        self.start_button.pack(side=tk.LEFT, padx=5)
+        self.pause_button = ttk.Button(
+            self.action_buttons,
+            text="暂停",
+            style="Warning.TButton",
+            command=self.pause_playback,
+        )
+        self.pause_button.pack(side=tk.LEFT, padx=5)
+        self.stop_button = ttk.Button(
+            self.action_buttons,
+            text="停止",
+            style="Danger.TButton",
+            command=self.stop_playback,
+        )
+        self.stop_button.pack(side=tk.LEFT, padx=5)
         self.rf_button = ttk.Button(
             self.action_buttons, text="RF输出：关闭", command=self.toggle_rf, state=tk.DISABLED
         )
@@ -1002,13 +1023,25 @@ class PlaybackModule(ttk.Frame):
             command=self.prepare_package,
         )
         self.prepare_button.pack(fill=tk.X, pady=3)
-        self.send_button = ttk.Button(actions, text="发送波形并配置设备", command=self.send_and_configure, state=tk.DISABLED)
+        self.send_button = ttk.Button(
+            actions,
+            text="发送波形并配置设备",
+            style="Teal.TButton",
+            command=self.send_and_configure,
+            state=tk.DISABLED,
+        )
         self.send_button.pack(fill=tk.X, pady=3)
         buttons = ttk.Frame(actions, style="Panel.TFrame")
         buttons.pack(fill=tk.X, pady=3)
-        ttk.Button(buttons, text="开始", command=self.start_playback).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(buttons, text="暂停", command=self.pause_playback).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        ttk.Button(buttons, text="停止", command=self.stop_playback).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            buttons, text="开始", style="Success.TButton", command=self.start_playback
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            buttons, text="暂停", style="Warning.TButton", command=self.pause_playback
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Button(
+            buttons, text="停止", style="Danger.TButton", command=self.stop_playback
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.rf_button = ttk.Button(actions, text="RF输出：关闭", command=self.toggle_rf, state=tk.DISABLED)
         self.rf_button.pack(fill=tk.X, pady=(5, 3))
         ttk.Label(actions, textvariable=self.validation_var, foreground="#64748b", wraplength=330, justify=tk.LEFT).pack(anchor="w", pady=(6, 0))
@@ -1566,7 +1599,7 @@ class PlaybackModule(ttk.Frame):
             self.messages.put(("connect_error", f"设备连接失败：{exc}"))
 
     def disconnect_devices(self) -> None:
-        self.stop_playback()
+        self.stop_playback(notify=False)
         release_warnings: tuple[str, ...] = ()
         if self.session is not None:
             release_warnings = self.session.close(return_to_local=True)
@@ -2021,7 +2054,7 @@ class PlaybackModule(ttk.Frame):
             messagebox.showerror("暂停失败", str(exc))
         self._log("回放已暂停。")
 
-    def stop_playback(self) -> None:
+    def stop_playback(self, notify: bool = True) -> None:
         was_preparing = self.start_transitioning or self.sequence_transitioning
         self._cancel_playback_operation()
         self.playing = False
@@ -2033,8 +2066,23 @@ class PlaybackModule(ttk.Frame):
                 self.session.stop(use_iqr=self.route_var.get() == ROUTE_IQR)
         except Exception as exc:
             messagebox.showerror("停止失败", str(exc))
-        self.play_status_var.set("准备已取消，波形未播放" if was_preparing else "回放已停止")
+            return
+        stopped_text = "准备已取消，波形未播放" if was_preparing else "回放已停止"
+        self.play_status_var.set(stopped_text)
+        self.status_var.set(stopped_text + "。")
         self._log("IQR100准备已取消，回放已停止。" if was_preparing else "回放已停止。")
+        if notify:
+            if was_preparing:
+                detail = "已取消设备回放准备，设备不会开始本次回放。"
+            elif self.simulation_var.get():
+                detail = "仿真回放已停止。"
+            else:
+                detail = "已向设备发送停止命令，当前回放已停止。"
+            if self.rf_enabled:
+                detail += "\n\n注意：RF输出仍处于开启状态，请根据需要单独关闭。"
+                messagebox.showwarning("回放已停止", detail)
+            else:
+                messagebox.showinfo("回放已停止", detail)
 
     def _update_rf_button(self) -> None:
         enabled = (
