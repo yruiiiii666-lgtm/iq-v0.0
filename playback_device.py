@@ -488,18 +488,33 @@ class VisaPlaybackSession:
         deadline = time.monotonic() + timeout_s
         state = ""
         while time.monotonic() < deadline:
-            with self._iqr_lock:
-                state = str(self.iqr.query("TRIGger:PLAYer:STATe?")).strip()
+            state = self.query_iqr_player_state()
             if "please wait" not in state.casefold():
                 return state
             time.sleep(0.2)
         raise TimeoutError(f"IQR加载记录超时，最后状态：{state or '无响应'}")
 
+    @staticmethod
+    def _parse_iqr_player_state(response: object) -> str:
+        """Return the readable state from an IQR SCPI string response.
+
+        IQR firmware returns player states as SCPI strings, for example
+        ``"Running"`` and ``"Ready"``.  PyVISA deliberately keeps those
+        surrounding quotes, so comparing its raw response with ``Running``
+        makes the UI miss both the start and completion transitions.
+        """
+
+        state = str(response).strip()
+        if len(state) >= 2 and state[0] == state[-1] and state[0] in ('"', "'"):
+            state = state[1:-1].strip()
+        return state
+
     def query_iqr_player_state(self) -> str:
         if self.iqr is None:
             raise RuntimeError("IQW/IQR记录仪尚未连接。")
         with self._iqr_lock:
-            return str(self.iqr.query("TRIGger:PLAYer:STATe?")).strip()
+            response = self.iqr.query("TRIGger:PLAYer:STATe?")
+        return self._parse_iqr_player_state(response)
 
     def query_iqr_player_run_mode(self) -> str:
         if self.iqr is None:
@@ -593,6 +608,8 @@ class VisaPlaybackSession:
                 normalized == "ready"
                 or normalized.startswith("waiting for lan remote trigger")
                 or normalized.startswith("press \"play\\rec\" button to start")
+                or normalized.startswith("waiting for trigger signal")
+                or normalized.startswith("waiting for time to elapse")
             ):
                 samples = self.query_iqr_replayed_samples()
                 self.logger(f"IQR Player单次回放完成：{state}｜{samples:g} Sa。")
