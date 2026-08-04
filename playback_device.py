@@ -494,6 +494,47 @@ class VisaPlaybackSession:
             time.sleep(0.2)
         raise TimeoutError(f"IQR加载记录超时，最后状态：{state or '无响应'}")
 
+    def _wait_iqr_player_armed_for_lan(self, timeout_s: float = 15.0) -> str:
+        """Wait until ARM ON has actually reached the LAN-trigger wait state."""
+
+        assert self.iqr is not None
+        deadline = time.monotonic() + timeout_s
+        state = ""
+        previous_state = ""
+        while time.monotonic() < deadline:
+            state = self.query_iqr_player_state()
+            if state != previous_state:
+                self.logger(f"IQR Player重新武装状态：{state or '空响应'}")
+                previous_state = state
+            normalized = " ".join(state.casefold().split())
+            if normalized.startswith("waiting for lan remote trigger"):
+                return state
+            if "error" in normalized or "failed" in normalized:
+                raise RuntimeError(f"IQR Player重新武装失败，设备状态：{state}")
+            time.sleep(0.1)
+        raise TimeoutError(
+            "等待IQR进入LAN远程触发就绪状态超时，"
+            f"最后状态：{state or '无响应'}"
+        )
+
+    def _wait_iqr_player_disarmed(self, timeout_s: float = 15.0) -> str:
+        """Wait for ARM OFF to finish before starting a fresh arm cycle."""
+
+        assert self.iqr is not None
+        deadline = time.monotonic() + timeout_s
+        state = ""
+        while time.monotonic() < deadline:
+            state = self.query_iqr_player_state()
+            normalized = " ".join(state.casefold().split())
+            if normalized == "ready":
+                return state
+            if "error" in normalized or "failed" in normalized:
+                raise RuntimeError(f"IQR Player解除武装失败，设备状态：{state}")
+            time.sleep(0.1)
+        raise TimeoutError(
+            f"等待IQR解除武装超时，最后状态：{state or '无响应'}"
+        )
+
     @staticmethod
     def _parse_iqr_player_state(response: object) -> str:
         """Return the readable state from an IQR SCPI string response.
@@ -717,7 +758,7 @@ class VisaPlaybackSession:
         active_run_mode = self.set_iqr_player_run_mode(continuous)
         self.iqr.write("TRIGger:PLAYer:SOURce LAN")
         self.iqr.write("TRIGger:PLAYer:ARM ON")
-        state = self._wait_iqr_player_ready()
+        state = self._wait_iqr_player_armed_for_lan()
         error = str(self.iqr.query("SYSTem:ERRor?")).strip()
         if not scpi_error_is_clear(error):
             raise RuntimeError(f"IQR记录加载失败：{error}")
@@ -743,11 +784,17 @@ class VisaPlaybackSession:
                     self.iqr.write("TRIGger:PLAYer:STARt")
                 else:
                     # A completed SINGle cycle may leave the trigger system
-                    # disarmed. Re-arm every fresh cycle before sending the LAN
-                    # trigger event so replay can be started repeatedly without
-                    # reloading the waveform.
+                    # between Ready and the LAN wait state.  Explicitly reset
+                    # the arm latch and wait for the *actual* armed state before
+                    # EXECute; otherwise a fast second click can send EXECute
+                    # while the recorder still reports Ready and the event is
+                    # silently lost.
+                    self.iqr.write("TRIGger:PLAYer:ARM OFF")
+                    self._wait_iqr_player_disarmed()
+                    self.iqr.write("TRIGger:PLAYer:SOURce LAN")
                     self.iqr.write("TRIGger:PLAYer:ARM ON")
-                    self._wait_iqr_player_ready()
+                    armed_state = self._wait_iqr_player_armed_for_lan()
+                    self.logger(f"IQR Player已等待LAN触发：{armed_state}。")
                     self.iqr.write("TRIGger:PLAYer:EXECute")
                 self._iqr_paused = False
         self.logger("回放已启动；RF是否打开由独立安全联锁控制。")
