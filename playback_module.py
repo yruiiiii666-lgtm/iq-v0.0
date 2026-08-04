@@ -84,6 +84,7 @@ class PlaybackModule(ttk.Frame):
         self.rf_state_known = False
         self.rf_poll_busy = False
         self.rf_control_busy = False
+        self.rf_state_revision = 0
         self.rf_poll_error_reported = False
         self.rf_poll_after_id: str | None = None
         self.playing = False
@@ -1594,6 +1595,7 @@ class PlaybackModule(ttk.Frame):
         self.connected = False
         self.rf_poll_busy = False
         self.rf_control_busy = False
+        self.rf_state_revision += 1
         self.iqr_catalog.clear()
         self.iqr_catalog_loaded = False
         self.iqr_catalog_busy = self.route_var.get() == ROUTE_IQR
@@ -1637,6 +1639,7 @@ class PlaybackModule(ttk.Frame):
         self.connected = False
         self.rf_poll_busy = False
         self.rf_control_busy = False
+        self.rf_state_revision += 1
         self.iqr_catalog.clear()
         self.iqr_catalog_loaded = False
         self.iqr_catalog_busy = False
@@ -2093,24 +2096,40 @@ class PlaybackModule(ttk.Frame):
     def stop_playback(self, notify: bool = True) -> None:
         was_preparing = self.start_transitioning or self.sequence_transitioning
         self._cancel_playback_operation()
+        self.rf_state_revision += 1
+        self.rf_control_busy = True
         self.playing = False
         self.hardware_playback_active = False
         self.sequence_transitioning = False
         self.stop_preview(True)
+        playback_stop_error: Exception | None = None
+        rf_close_error: Exception | None = None
         try:
             if self.session is not None and not self.simulation_var.get():
                 self.session.stop(use_iqr=self.route_var.get() == ROUTE_IQR)
         except Exception as exc:
-            messagebox.showerror("停止失败", str(exc))
-            return
+            playback_stop_error = exc
+            self._log(f"设备回放停止命令失败：{exc}")
+        if self.session is not None and not self.simulation_var.get():
+            try:
+                self.session.set_rf(False)
+            except Exception as exc:
+                rf_close_error = exc
+                self._set_rf_unknown()
+            else:
+                self._apply_rf_state(False, source="stop")
+        self.rf_control_busy = False
         self.device_configured = False
         self._update_action_states()
         self._update_rf_button()
-        stopped_text = (
-            "准备已取消，需重新发送并配置设备"
-            if was_preparing
-            else "回放已停止，需重新发送并配置设备"
-        )
+        if playback_stop_error is not None:
+            stopped_text = "已请求停止但设备回放状态未确认，需重新配置设备"
+        else:
+            stopped_text = (
+                "准备已取消，需重新发送并配置设备"
+                if was_preparing
+                else "回放已停止，需重新发送并配置设备"
+            )
         self.play_status_var.set(stopped_text)
         self.status_var.set(stopped_text + "。")
         self._log("IQR100准备已取消，回放已停止。" if was_preparing else "回放已停止。")
@@ -2122,10 +2141,15 @@ class PlaybackModule(ttk.Frame):
             else:
                 detail = "已向设备发送停止命令，当前回放已停止。"
             detail += "\n\n如需再次回放，请先点击“发送波形并配置设备”。"
-            if self.rf_enabled:
-                detail += "\n\n注意：RF输出仍处于开启状态，请根据需要单独关闭。"
+            if playback_stop_error is not None:
+                detail += f"\n\n警告：设备回放停止状态未能确认：{playback_stop_error}"
+            if rf_close_error is not None:
+                detail += f"\n\n警告：RF关闭状态未能确认：{rf_close_error}"
+            if playback_stop_error is not None or rf_close_error is not None:
                 messagebox.showwarning("回放已停止", detail)
             else:
+                if not self.simulation_var.get():
+                    detail += "\n\nRF输出已关闭并经设备回读确认。"
                 messagebox.showinfo("回放已停止", detail)
 
     def _apply_rf_state(self, enabled: bool, source: str = "device") -> None:
@@ -2181,20 +2205,21 @@ class PlaybackModule(ttk.Frame):
         )
         if can_poll:
             self.rf_poll_busy = True
+            revision = self.rf_state_revision
             threading.Thread(
                 target=self._rf_status_worker,
-                args=(session,),
+                args=(session, revision),
                 daemon=True,
             ).start()
         self.rf_poll_after_id = self.after(750, self._poll_rf_device_status)
 
-    def _rf_status_worker(self, session: VisaPlaybackSession) -> None:
+    def _rf_status_worker(self, session: VisaPlaybackSession, revision: int) -> None:
         try:
             enabled = session.query_rf_enabled()
         except Exception as exc:
-            self.messages.put(("rf_status_error", (session, str(exc))))
+            self.messages.put(("rf_status_error", (session, revision, str(exc))))
         else:
-            self.messages.put(("rf_status", (session, enabled)))
+            self.messages.put(("rf_status", (session, revision, enabled)))
 
     def toggle_rf(self) -> None:
         if self.rf_control_busy:
@@ -2203,34 +2228,41 @@ class PlaybackModule(ttk.Frame):
         if self.session is None or not self.connected or self.simulation_var.get():
             messagebox.showwarning("设备未连接", "请先连接SMBV100A设备。")
             return
+        self.rf_state_revision += 1
+        revision = self.rf_state_revision
         self.rf_control_busy = True
         self.rf_button.configure(text="RF输出：读取中…", state=tk.DISABLED)
         session = self.session
         threading.Thread(
             target=self._rf_toggle_query_worker,
-            args=(session,),
+            args=(session, revision),
             daemon=True,
         ).start()
 
-    def _rf_toggle_query_worker(self, session: VisaPlaybackSession) -> None:
+    def _rf_toggle_query_worker(self, session: VisaPlaybackSession, revision: int) -> None:
         try:
             current = session.query_rf_enabled()
         except Exception as exc:
-            self.messages.put(("rf_control_error", (session, f"读取RF状态失败：{exc}")))
+            self.messages.put(
+                ("rf_control_error", (session, revision, f"读取RF状态失败：{exc}"))
+            )
         else:
-            self.messages.put(("rf_toggle_ready", (session, current)))
+            self.messages.put(("rf_toggle_ready", (session, revision, current)))
 
     def _set_rf_worker(
         self,
         session: VisaPlaybackSession,
+        revision: int,
         requested: bool,
     ) -> None:
         try:
             actual = session.set_rf(requested)
         except Exception as exc:
-            self.messages.put(("rf_control_error", (session, f"切换RF状态失败：{exc}")))
+            self.messages.put(
+                ("rf_control_error", (session, revision, f"切换RF状态失败：{exc}"))
+            )
         else:
-            self.messages.put(("rf_set_result", (session, actual)))
+            self.messages.put(("rf_set_result", (session, revision, actual)))
 
     def toggle_preview(self) -> None:
         if self.current_result is None:
@@ -2777,23 +2809,31 @@ class PlaybackModule(ttk.Frame):
                 self._update_action_states()
                 self._update_rf_button()
             elif kind == "rf_status":
-                session, enabled = payload  # type: ignore[misc]
+                session, revision, enabled = payload  # type: ignore[misc]
                 self.rf_poll_busy = False
-                if session is not self.session or self.rf_control_busy:
+                if (
+                    session is not self.session
+                    or revision != self.rf_state_revision
+                    or self.rf_control_busy
+                ):
                     continue
                 self._apply_rf_state(bool(enabled), source="poll")
             elif kind == "rf_status_error":
-                session, error_text = payload  # type: ignore[misc]
+                session, revision, error_text = payload  # type: ignore[misc]
                 self.rf_poll_busy = False
-                if session is not self.session or self.rf_control_busy:
+                if (
+                    session is not self.session
+                    or revision != self.rf_state_revision
+                    or self.rf_control_busy
+                ):
                     continue
                 self._set_rf_unknown()
                 if not self.rf_poll_error_reported:
                     self.rf_poll_error_reported = True
                     self._log(f"SMBV100A RF状态轮询失败：{error_text}")
             elif kind == "rf_toggle_ready":
-                session, current = payload  # type: ignore[misc]
-                if session is not self.session:
+                session, revision, current = payload  # type: ignore[misc]
+                if session is not self.session or revision != self.rf_state_revision:
                     self.rf_control_busy = False
                     self._update_rf_button()
                     continue
@@ -2827,12 +2867,12 @@ class PlaybackModule(ttk.Frame):
                 )
                 threading.Thread(
                     target=self._set_rf_worker,
-                    args=(session, requested),
+                    args=(session, revision, requested),
                     daemon=True,
                 ).start()
             elif kind == "rf_set_result":
-                session, actual = payload  # type: ignore[misc]
-                if session is not self.session:
+                session, revision, actual = payload  # type: ignore[misc]
+                if session is not self.session or revision != self.rf_state_revision:
                     self.rf_control_busy = False
                     self._update_rf_button()
                     continue
@@ -2842,8 +2882,8 @@ class PlaybackModule(ttk.Frame):
                 self.status_var.set(message)
                 self._log(message)
             elif kind == "rf_control_error":
-                session, error_text = payload  # type: ignore[misc]
-                if session is not self.session:
+                session, revision, error_text = payload  # type: ignore[misc]
+                if session is not self.session or revision != self.rf_state_revision:
                     continue
                 self.rf_control_busy = False
                 self._set_rf_unknown()
