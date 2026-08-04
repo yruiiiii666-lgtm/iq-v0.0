@@ -81,6 +81,11 @@ class PlaybackModule(ttk.Frame):
         self.connected = False
         self.device_configured = False
         self.rf_enabled = False
+        self.rf_state_known = False
+        self.rf_poll_busy = False
+        self.rf_control_busy = False
+        self.rf_poll_error_reported = False
+        self.rf_poll_after_id: str | None = None
         self.playing = False
         self.hardware_playback_active = False
         self.sequence_transitioning = False
@@ -162,6 +167,7 @@ class PlaybackModule(ttk.Frame):
             )
         self._on_simulation_toggled(announce=False)
         self.after(100, self._poll_messages)
+        self.rf_poll_after_id = self.after(750, self._poll_rf_device_status)
 
     def _build_ui(self) -> None:
         self.top_shell = ttk.Frame(self, style="Panel.TFrame")
@@ -605,7 +611,11 @@ class PlaybackModule(ttk.Frame):
         )
         self.stop_button.pack(side=tk.LEFT, padx=5)
         self.rf_button = ttk.Button(
-            self.action_buttons, text="RF输出：关闭", command=self.toggle_rf, state=tk.DISABLED
+            self.action_buttons,
+            text="RF输出：未知",
+            style="RFOff.TButton",
+            command=self.toggle_rf,
+            state=tk.DISABLED,
         )
         self.rf_button.pack(side=tk.LEFT, padx=5)
         self.validation_label = ttk.Label(
@@ -1042,7 +1052,13 @@ class PlaybackModule(ttk.Frame):
         ttk.Button(
             buttons, text="停止", style="Danger.TButton", command=self.stop_playback
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.rf_button = ttk.Button(actions, text="RF输出：关闭", command=self.toggle_rf, state=tk.DISABLED)
+        self.rf_button = ttk.Button(
+            actions,
+            text="RF输出：未知",
+            style="RFOff.TButton",
+            command=self.toggle_rf,
+            state=tk.DISABLED,
+        )
         self.rf_button.pack(fill=tk.X, pady=(5, 3))
         ttk.Label(actions, textvariable=self.validation_var, foreground="#64748b", wraplength=330, justify=tk.LEFT).pack(anchor="w", pady=(6, 0))
         self._update_route_state()
@@ -1181,8 +1197,9 @@ class PlaybackModule(ttk.Frame):
                     self.session.set_rf(False)
             except Exception as exc:
                 self._log(f"切换回放模式时关闭 RF 失败：{exc}")
-            self.rf_enabled = False
-            self.rf_button.configure(text="RF输出：关闭")
+                self._set_rf_unknown()
+            else:
+                self._apply_rf_state(False, source="mode_change")
         self.current_result = None
         self.raw_recording = None
         self.raw_sequence.clear()
@@ -1457,6 +1474,7 @@ class PlaybackModule(ttk.Frame):
             self.iqr_catalog_busy = False
             self.device_configured = False
             self.rf_enabled = False
+            self.rf_state_known = False
             self.device_identities = ("离线仿真", "不使用")
             self.smw_identity_var.set(self.device_identities[0])
             self.iqr_identity_var.set(self.device_identities[1])
@@ -1465,7 +1483,11 @@ class PlaybackModule(ttk.Frame):
             self.disconnect_button.configure(state=tk.DISABLED)
             self.iqr_catalog_button.configure(state=tk.DISABLED)
             self.send_button.configure(text="准备仿真回放")
-            self.rf_button.configure(text="RF输出：仿真模式", state=tk.DISABLED)
+            self.rf_button.configure(
+                text="RF输出：仿真模式",
+                style="RFOff.TButton",
+                state=tk.DISABLED,
+            )
         else:
             if self.route_var.get() == ROUTE_SIM:
                 hardware_route = ROUTE_IQR if self._is_raw_mode() else self.last_hardware_route
@@ -1478,6 +1500,7 @@ class PlaybackModule(ttk.Frame):
             self.iqr_catalog_busy = False
             self.device_configured = False
             self.rf_enabled = False
+            self.rf_state_known = False
             self.device_identities = ("未连接", "未连接")
             self.smw_identity_var.set("未连接")
             self.iqr_identity_var.set("未连接")
@@ -1486,7 +1509,7 @@ class PlaybackModule(ttk.Frame):
             self.disconnect_button.configure(state=tk.NORMAL)
             self.iqr_catalog_button.configure(state=tk.DISABLED)
             self.send_button.configure(text="发送波形并配置设备")
-            self.rf_button.configure(text="RF输出：关闭")
+            self.rf_button.configure(text="RF输出：未连接", style="RFOff.TButton")
             if self.current_result is None:
                 self.validation_var.set("实物设备模式：请先载入回放源并配置设备。")
             elif self._is_raw_mode():
@@ -1565,12 +1588,15 @@ class PlaybackModule(ttk.Frame):
             self.session.close()
             self.session = None
         self.connected = False
+        self.rf_poll_busy = False
+        self.rf_control_busy = False
         self.iqr_catalog.clear()
         self.iqr_catalog_loaded = False
         self.iqr_catalog_busy = self.route_var.get() == ROUTE_IQR
         self.device_configured = False
         self.rf_enabled = False
-        self.rf_button.configure(text="RF输出：关闭")
+        self.rf_state_known = False
+        self.rf_button.configure(text="RF输出：连接中…", style="RFOff.TButton")
         self._update_rf_button()
         self.device_identities = ("正在识别...", "正在识别..." if self.route_var.get() == ROUTE_IQR else "未连接")
         self.smw_identity_var.set(self.device_identities[0])
@@ -1605,11 +1631,14 @@ class PlaybackModule(ttk.Frame):
             release_warnings = self.session.close(return_to_local=True)
             self.session = None
         self.connected = False
+        self.rf_poll_busy = False
+        self.rf_control_busy = False
         self.iqr_catalog.clear()
         self.iqr_catalog_loaded = False
         self.iqr_catalog_busy = False
         self.device_configured = False
         self.rf_enabled = False
+        self.rf_state_known = False
         self.device_identities = ("未连接", "未连接")
         self.smw_identity_var.set("未连接")
         self.iqr_identity_var.set("未连接")
@@ -1619,7 +1648,7 @@ class PlaybackModule(ttk.Frame):
             self.device_status_var.set("设备已断开，并已返回本地面板控制。")
         self.iqr_catalog_button.configure(state=tk.DISABLED)
         self._update_iqr_match_feedback(self.raw_recording or self._selected_raw_recording())
-        self.rf_button.configure(text="RF输出：关闭")
+        self.rf_button.configure(text="RF输出：未连接", style="RFOff.TButton")
         self._update_rf_button()
         if release_warnings:
             for warning in release_warnings:
@@ -1801,6 +1830,7 @@ class PlaybackModule(ttk.Frame):
             messagebox.showerror("设备参数无效", str(exc))
             return
         self.device_status_var.set("正在发送波形并配置设备；RF保持关闭...")
+        self._update_rf_button()
         threading.Thread(
             target=self._send_worker,
             args=(settings, self._is_raw_sequence_mode()),
@@ -2084,36 +2114,109 @@ class PlaybackModule(ttk.Frame):
             else:
                 messagebox.showinfo("回放已停止", detail)
 
-    def _update_rf_button(self) -> None:
-        enabled = (
-            self.connected
-            and self.device_configured
-            and self.safety_confirm_var.get()
-            and not self.simulation_var.get()
+    def _apply_rf_state(self, enabled: bool, source: str = "device") -> None:
+        previous = self.rf_enabled if self.rf_state_known else None
+        self.rf_enabled = bool(enabled)
+        self.rf_state_known = True
+        self.rf_poll_error_reported = False
+        self.rf_button.configure(
+            text=f"RF输出：{'开启' if enabled else '关闭'}",
+            style="Danger.TButton" if enabled else "RFOff.TButton",
         )
-        self.rf_button.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+        self._update_rf_button()
+        if source == "poll" and previous is not None and previous != enabled:
+            message = f"检测到SMBV100A面板将RF输出切换为{'开启' if enabled else '关闭'}。"
+            self.status_var.set(message)
+            self._log(message)
+
+    def _set_rf_unknown(self) -> None:
+        self.rf_state_known = False
+        self.rf_button.configure(text="RF输出：状态未知", style="Warning.TButton")
+        self._update_rf_button()
+
+    def _update_rf_button(self) -> None:
+        controllable = (
+            self.connected
+            and self.session is not None
+            and not self.simulation_var.get()
+            and not self.rf_control_busy
+            and not self.device_status_var.get().startswith("正在发送波形并配置设备")
+            and not self.start_transitioning
+            and not self.sequence_transitioning
+            and (
+                self.rf_enabled
+                or not self.rf_state_known
+                or (self.device_configured and self.safety_confirm_var.get())
+            )
+        )
+        self.rf_button.configure(state=tk.NORMAL if controllable else tk.DISABLED)
+
+    def _poll_rf_device_status(self) -> None:
+        self.rf_poll_after_id = None
+        session = self.session
+        status_text = self.device_status_var.get()
+        can_poll = (
+            session is not None
+            and self.connected
+            and not self.simulation_var.get()
+            and not self.rf_poll_busy
+            and not self.rf_control_busy
+            and not self.start_transitioning
+            and not self.sequence_transitioning
+            and not status_text.startswith("正在发送波形并配置设备")
+        )
+        if can_poll:
+            self.rf_poll_busy = True
+            threading.Thread(
+                target=self._rf_status_worker,
+                args=(session,),
+                daemon=True,
+            ).start()
+        self.rf_poll_after_id = self.after(750, self._poll_rf_device_status)
+
+    def _rf_status_worker(self, session: VisaPlaybackSession) -> None:
+        try:
+            enabled = session.query_rf_enabled()
+        except Exception as exc:
+            self.messages.put(("rf_status_error", (session, str(exc))))
+        else:
+            self.messages.put(("rf_status", (session, enabled)))
 
     def toggle_rf(self) -> None:
-        if not self.safety_confirm_var.get():
-            messagebox.showwarning("安全联锁未确认", "请确认射频链路、衰减器、功放和负载安全。")
+        if self.rf_control_busy:
+            self.status_var.set("正在读取或切换RF输出状态，请稍候。")
             return
-        requested = not self.rf_enabled
-        if requested:
-            if not messagebox.askyesno(
-                "确认打开RF输出",
-                f"将以{self.rf_level_var.get()} dBm打开SMBV100A射频输出。\n"
-                "请再次确认后级链路和负载安全。",
-            ):
-                return
+        if self.session is None or not self.connected or self.simulation_var.get():
+            messagebox.showwarning("设备未连接", "请先连接SMBV100A设备。")
+            return
+        self.rf_control_busy = True
+        self.rf_button.configure(text="RF输出：读取中…", state=tk.DISABLED)
+        session = self.session
+        threading.Thread(
+            target=self._rf_toggle_query_worker,
+            args=(session,),
+            daemon=True,
+        ).start()
+
+    def _rf_toggle_query_worker(self, session: VisaPlaybackSession) -> None:
         try:
-            if self.session is not None and not self.simulation_var.get():
-                self.session.set_rf(requested)
+            current = session.query_rf_enabled()
         except Exception as exc:
-            messagebox.showerror("RF控制失败", str(exc))
-            return
-        self.rf_enabled = requested
-        self.rf_button.configure(text=f"RF输出：{'开启' if requested else '关闭'}")
-        self._log(f"RF输出切换为{'开启' if requested else '关闭'}。")
+            self.messages.put(("rf_control_error", (session, f"读取RF状态失败：{exc}")))
+        else:
+            self.messages.put(("rf_toggle_ready", (session, current)))
+
+    def _set_rf_worker(
+        self,
+        session: VisaPlaybackSession,
+        requested: bool,
+    ) -> None:
+        try:
+            actual = session.set_rf(requested)
+        except Exception as exc:
+            self.messages.put(("rf_control_error", (session, f"切换RF状态失败：{exc}")))
+        else:
+            self.messages.put(("rf_set_result", (session, actual)))
 
     def toggle_preview(self) -> None:
         if self.current_result is None:
@@ -2216,8 +2319,9 @@ class PlaybackModule(ttk.Frame):
                         self.session.set_rf(False)
                     except Exception as exc:
                         self._log(f"场景顺序结束时关闭RF失败：{exc}")
-                self.rf_enabled = False
-                self.rf_button.configure(text="RF输出：关闭")
+                        self._set_rf_unknown()
+                    else:
+                        self._apply_rf_state(False, source="sequence")
                 self.playing = False
                 self.hardware_playback_active = False
                 self.preview_clock_started_at = None
@@ -2269,7 +2373,12 @@ class PlaybackModule(ttk.Frame):
             return
         restore_rf = self.rf_enabled and self.safety_confirm_var.get()
         self.rf_enabled = False
-        self.rf_button.configure(text="RF输出：关闭")
+        self.rf_state_known = False
+        self.rf_button.configure(
+            text="RF输出：场景切换中…",
+            style="Warning.TButton",
+            state=tk.DISABLED,
+        )
         request_id, cancel_event = self._begin_playback_operation()
         self.start_transitioning = True
         self.play_status_var.set("正在装载下一条IQ，软件波形暂不计时")
@@ -2583,6 +2692,10 @@ class PlaybackModule(ttk.Frame):
             elif kind == "connected":
                 self.session, identities, catalog, catalog_error = payload  # type: ignore[misc]
                 self.connected = True
+                self.rf_poll_busy = False
+                self.rf_control_busy = False
+                self.rf_state_known = False
+                self.rf_button.configure(text="RF输出：读取中…", style="Warning.TButton")
                 self.device_identities = identities
                 self.smw_identity_var.set(identities[0])
                 self.iqr_identity_var.set(identities[1])
@@ -2630,7 +2743,82 @@ class PlaybackModule(ttk.Frame):
                 self.device_configured = True
                 self.device_status_var.set(str(payload))
                 self._log(f"设备配置完成：{payload}")
+                if not self.simulation_var.get():
+                    self._apply_rf_state(False, source="configuration")
                 self._update_rf_button()
+            elif kind == "rf_status":
+                session, enabled = payload  # type: ignore[misc]
+                self.rf_poll_busy = False
+                if session is not self.session or self.rf_control_busy:
+                    continue
+                self._apply_rf_state(bool(enabled), source="poll")
+            elif kind == "rf_status_error":
+                session, error_text = payload  # type: ignore[misc]
+                self.rf_poll_busy = False
+                if session is not self.session or self.rf_control_busy:
+                    continue
+                self._set_rf_unknown()
+                if not self.rf_poll_error_reported:
+                    self.rf_poll_error_reported = True
+                    self._log(f"SMBV100A RF状态轮询失败：{error_text}")
+            elif kind == "rf_toggle_ready":
+                session, current = payload  # type: ignore[misc]
+                if session is not self.session:
+                    self.rf_control_busy = False
+                    self._update_rf_button()
+                    continue
+                current = bool(current)
+                self._apply_rf_state(current, source="control")
+                requested = not current
+                if requested and not self.device_configured:
+                    self.rf_control_busy = False
+                    self._update_rf_button()
+                    messagebox.showwarning("设备尚未配置", "请先发送波形并配置设备，再开启RF输出。")
+                    continue
+                if requested and not self.safety_confirm_var.get():
+                    self.rf_control_busy = False
+                    self._update_rf_button()
+                    messagebox.showwarning(
+                        "安全联锁未确认",
+                        "请先确认射频链路、衰减器、功放和负载安全。",
+                    )
+                    continue
+                if requested and not messagebox.askyesno(
+                    "确认打开RF输出",
+                    f"将以{self.rf_level_var.get()} dBm打开SMBV100A射频输出。\n"
+                    "请再次确认后级链路和负载安全。",
+                ):
+                    self.rf_control_busy = False
+                    self._update_rf_button()
+                    continue
+                self.rf_button.configure(
+                    text=f"RF输出：正在{'开启' if requested else '关闭'}…",
+                    state=tk.DISABLED,
+                )
+                threading.Thread(
+                    target=self._set_rf_worker,
+                    args=(session, requested),
+                    daemon=True,
+                ).start()
+            elif kind == "rf_set_result":
+                session, actual = payload  # type: ignore[misc]
+                if session is not self.session:
+                    self.rf_control_busy = False
+                    self._update_rf_button()
+                    continue
+                self.rf_control_busy = False
+                self._apply_rf_state(bool(actual), source="control")
+                message = f"SMBV100A RF输出已切换并回读确认为{'开启' if actual else '关闭'}。"
+                self.status_var.set(message)
+                self._log(message)
+            elif kind == "rf_control_error":
+                session, error_text = payload  # type: ignore[misc]
+                if session is not self.session:
+                    continue
+                self.rf_control_busy = False
+                self._set_rf_unknown()
+                self._log(str(error_text))
+                messagebox.showerror("RF控制失败", str(error_text))
             elif kind == "playback_triggered":
                 request_id, run_mode, expected_duration_s = payload  # type: ignore[misc]
                 if request_id != self.playback_request_id:
@@ -2739,8 +2927,7 @@ class PlaybackModule(ttk.Frame):
                 self.device_configured = True
                 self.playing = True
                 self.hardware_playback_active = True
-                self.rf_enabled = bool(restored_rf)
-                self.rf_button.configure(text=f"RF输出：{'开启' if restored_rf else '关闭'}")
+                self._apply_rf_state(bool(restored_rf), source="sequence")
                 self.device_status_var.set(f"SMBV100A: {smw_status}｜IQR100: {iqr_status}")
                 self._start_preview_clock()
                 self._log(
@@ -2758,7 +2945,7 @@ class PlaybackModule(ttk.Frame):
                 self.hardware_playback_active = False
                 self.device_configured = False
                 self.rf_enabled = False
-                self.rf_button.configure(text="RF输出：关闭")
+                self._set_rf_unknown()
                 self.device_status_var.set(str(error_text))
                 self.play_status_var.set("下一条IQ实际数据流未启动，软件波形未播放")
                 self._log(str(error_text))
@@ -2767,6 +2954,7 @@ class PlaybackModule(ttk.Frame):
                 self._log(str(payload))
             elif kind == "connect_error":
                 self.connected = False
+                self.rf_state_known = False
                 self.iqr_catalog.clear()
                 self.iqr_catalog_loaded = False
                 self.iqr_catalog_busy = False
@@ -2774,6 +2962,7 @@ class PlaybackModule(ttk.Frame):
                 self.smw_identity_var.set("未连接")
                 self.iqr_identity_var.set("未连接")
                 self.device_status_var.set(str(payload))
+                self.rf_button.configure(text="RF输出：未连接", style="RFOff.TButton")
                 self.iqr_catalog_button.configure(state=tk.DISABLED)
                 self._update_iqr_match_feedback(self.raw_recording or self._selected_raw_recording())
                 self._update_action_states()
@@ -2782,6 +2971,7 @@ class PlaybackModule(ttk.Frame):
                 messagebox.showerror("回放操作失败", str(payload))
             elif kind == "error":
                 self.device_status_var.set(str(payload))
+                self._update_rf_button()
                 self._log(str(payload))
                 messagebox.showerror("回放操作失败", str(payload))
         self.after(100, self._poll_messages)
@@ -2795,6 +2985,9 @@ class PlaybackModule(ttk.Frame):
 
     def shutdown(self) -> None:
         self._cancel_playback_operation()
+        if self.rf_poll_after_id is not None:
+            self.after_cancel(self.rf_poll_after_id)
+            self.rf_poll_after_id = None
         self.stop_preview(False)
         self._close_device_details()
         if self.session is not None:

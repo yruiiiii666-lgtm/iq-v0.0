@@ -779,6 +779,7 @@ class IQAnalyzerApp(tk.Tk):
             "Success.TButton": ("#15803d", "#166534", "#14532d"),
             "Warning.TButton": ("#d97706", "#b45309", "#92400e"),
             "Danger.TButton": (colors["danger"], "#a8323d", "#842631"),
+            "RFOff.TButton": ("#475569", "#334155", "#1e293b"),
         }
         for style_name, (normal, active, pressed) in semantic_buttons.items():
             style.configure(

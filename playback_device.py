@@ -300,6 +300,7 @@ class VisaPlaybackSession:
         self._iqr_paused = False
         self._iqr_display_mode = "IQ"
         self._iqr_lock = threading.RLock()
+        self._smw_lock = threading.RLock()
 
     @property
     def iqr_paused(self) -> bool:
@@ -796,11 +797,30 @@ class VisaPlaybackSession:
                 self.iqr.write("TRIGger:PLAYer:STOP")
                 self._iqr_paused = False
 
-    def set_rf(self, enabled: bool) -> None:
+    def query_rf_enabled(self) -> bool:
         if self.smw is None:
             raise RuntimeError("SMBV100A尚未连接。")
-        self.smw.write(f"OUTPut1:STATe {'ON' if enabled else 'OFF'}")
-        self.logger(f"SMBV100A RF输出：{'ON' if enabled else 'OFF'}")
+        with self._smw_lock:
+            response = str(self.smw.query("OUTPut1:STATe?")).strip().strip('"').upper()
+        if response in ("1", "ON"):
+            return True
+        if response in ("0", "OFF"):
+            return False
+        raise RuntimeError(f"SMBV100A RF状态无法解析：{response!r}")
+
+    def set_rf(self, enabled: bool) -> bool:
+        if self.smw is None:
+            raise RuntimeError("SMBV100A尚未连接。")
+        with self._smw_lock:
+            self.smw.write(f"OUTPut1:STATe {'ON' if enabled else 'OFF'}")
+            actual = self.query_rf_enabled()
+        if actual != enabled:
+            raise RuntimeError(
+                f"SMBV100A RF切换未生效：请求{'ON' if enabled else 'OFF'}，"
+                f"设备回读{'ON' if actual else 'OFF'}。"
+            )
+        self.logger(f"SMBV100A RF输出已回读确认：{'ON' if actual else 'OFF'}")
+        return actual
 
     def _return_resource_to_local(self, resource, label: str) -> str | None:
         visa_error: Exception | None = None
