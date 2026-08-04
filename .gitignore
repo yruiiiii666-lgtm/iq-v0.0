@@ -1,0 +1,37 @@
+# IDE and Python environments
+.idea/
+.vscode/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local builds and packaged applications
+.portable_build/
+portable_dist/
+build/
+dist/
+*.exe
+*.zip
+
+# Generated analysis and playback output
+output/
+output_*/
+*.db
+*.log
+
+# Large/local IQ recordings and generated waveforms
+data/
+*.wv
+*.wva
+*.wvd
+*.wvh
+*.wsm
+*.ws[0-9]*
+*.npy
+*.bin
+
+# OS files
+.DS_Store
+Thumbs.db
