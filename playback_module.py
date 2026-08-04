@@ -2273,6 +2273,14 @@ class PlaybackModule(ttk.Frame):
         self.preview_elapsed_origin_ms = self.display_elapsed_ms
         self.preview_clock_started_at = None
 
+    def _require_new_device_configuration(self) -> None:
+        """Invalidate the one-shot configuration after a stop or completed replay."""
+
+        self.device_configured = False
+        self._update_action_states()
+        self._update_rf_button()
+        self.validation_var.set("本次回放已结束；请重新发送波形并配置设备后再开始回放。")
+
     def _on_seek(self, value: str) -> None:
         try:
             selected_ms = max(0.0, float(value))
@@ -2311,6 +2319,9 @@ class PlaybackModule(ttk.Frame):
             self.preview_clock_started_at = None
             self.play_after_id = None
             self.play_button.configure(text="重新预览")
+            self._require_new_device_configuration()
+            self.play_status_var.set("回放已完成，需重新发送波形并配置设备")
+            self.status_var.set("回放已完成；开始回放已禁用，请重新发送并配置设备。")
             return
         self.display_elapsed_ms = elapsed_ms
         self.position_ms_var.set(elapsed_ms % requested_ms)
@@ -2340,7 +2351,11 @@ class PlaybackModule(ttk.Frame):
                 self.hardware_playback_active = False
                 self.preview_clock_started_at = None
                 self.play_button.configure(text="重新预览")
-                message = f"{self.raw_scene_var.get()}场景全部{len(self.raw_sequence)}条IQ已依次回放完成。"
+                self._require_new_device_configuration()
+                message = (
+                    f"{self.raw_scene_var.get()}场景全部{len(self.raw_sequence)}条IQ已依次回放完成；"
+                    "请重新发送波形并配置设备。"
+                )
                 self.play_status_var.set(message)
                 self.status_var.set(message)
                 self._log(message)
@@ -2912,6 +2927,7 @@ class PlaybackModule(ttk.Frame):
                 if self.current_result is not None:
                     self.draw_preview()
                 self.play_button.configure(text="重新预览")
+                self._require_new_device_configuration()
                 sample_text = (
                     f"{float(final_samples):g} Sa"
                     if final_samples is not None
@@ -2919,13 +2935,13 @@ class PlaybackModule(ttk.Frame):
                 )
                 self.device_status_var.set(
                     f"IQR100单次回放已完成｜Player：{player_state}｜"
-                    f"最终样本计数：{sample_text}｜可直接再次点击开始回放"
+                    f"最终样本计数：{sample_text}｜需重新发送波形并配置设备"
                 )
-                self.play_status_var.set("IQR100单次回放已完成，可直接重新回放")
-                self.status_var.set("设备单次回放已完成。")
+                self.play_status_var.set("IQR100单次回放已完成，需重新发送波形并配置设备")
+                self.status_var.set("设备单次回放已完成；开始回放已禁用。")
                 self._log(
                     f"IQR100单次回放已完成：Player={player_state}，"
-                    f"最终样本计数={sample_text}；设备保持已配置状态。"
+                    f"最终样本计数={sample_text}；设备配置状态已失效。"
                 )
             elif kind == "playback_monitor_error":
                 request_id, error_text = payload  # type: ignore[misc]
