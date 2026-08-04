@@ -1863,7 +1863,8 @@ class PlaybackModule(ttk.Frame):
                     display_mode,
                     self.loop_enabled_var.get() and not self._is_raw_sequence_mode(),
                     watch_single_completion,
-                    expected_duration_s + 120.0,
+                    expected_duration_s,
+                    30.0,
                     request_id,
                     cancel_event,
                 ),
@@ -1903,6 +1904,7 @@ class PlaybackModule(ttk.Frame):
         display_mode: str,
         expected_continuous: bool,
         watch_single_completion: bool,
+        expected_duration_s: float,
         completion_timeout_s: float,
         request_id: int,
         cancel_event: threading.Event,
@@ -1910,13 +1912,10 @@ class PlaybackModule(ttk.Frame):
         try:
             if cancel_event.is_set():
                 return
-            session.start(use_iqr=True, iqr_display_mode=display_mode)
-            state, replayed_samples = session.wait_iqr_stream_active(
-                cancel_check=cancel_event.is_set
-            )
-            if cancel_event.is_set():
-                session.stop(use_iqr=True)
-                return
+            # Read settings before the trigger.  Some IQR firmware does not
+            # answer VISA queries while a native recording is being replayed;
+            # querying immediately after EXECute can therefore time out even
+            # though the hardware completes the replay successfully.
             run_mode = session.query_iqr_player_run_mode()
             expected_prefix = "CONT" if expected_continuous else "SING"
             if expected_prefix not in run_mode.upper():
@@ -1924,14 +1923,24 @@ class PlaybackModule(ttk.Frame):
                 raise RuntimeError(
                     f"循环设置未与IQR100同步：软件要求{expected_text}，设备回读{run_mode}。"
                 )
-            link_status = session.verify_smw_digital_iq_stream()
+            session.start(use_iqr=True, iqr_display_mode=display_mode)
+            if cancel_event.is_set():
+                session.stop(use_iqr=True)
+                return
             self.messages.put(
                 (
-                    "playback_started",
-                    (request_id, state, run_mode, replayed_samples, link_status),
+                    "playback_triggered",
+                    (request_id, run_mode, expected_duration_s),
                 )
             )
             if watch_single_completion:
+                # Do not poll IQR during the known replay interval.  On the
+                # affected firmware a STATe?/SAMPles? query occupies the VISA
+                # session until its 10 s timeout.  Wait locally, then confirm
+                # Ready after the recorder has returned to its command loop.
+                settling_s = min(2.0, max(0.75, expected_duration_s * 0.05))
+                if cancel_event.wait(expected_duration_s + settling_s):
+                    return
                 try:
                     completed_state, final_samples = session.wait_iqr_player_complete(
                         timeout_s=completion_timeout_s,
@@ -1940,12 +1949,33 @@ class PlaybackModule(ttk.Frame):
                 except InterruptedError:
                     return
                 except Exception as exc:
-                    self.messages.put(
-                        (
-                            "playback_monitor_error",
-                            (request_id, f"IQR100回放完成状态监测失败：{exc}"),
-                        )
+                    error_text = str(exc)
+                    is_visa_timeout = (
+                        "VI_ERROR_TMO" in error_text
+                        or "-1073807339" in error_text
+                        or "timeout expired" in error_text.casefold()
                     )
+                    if is_visa_timeout:
+                        self.messages.put(
+                            (
+                                "log",
+                                "IQR100已到达单次回放预计结束时间；设备状态查询仍超时，"
+                                "按已发送的单次任务结束处理。",
+                            )
+                        )
+                        self.messages.put(
+                            (
+                                "playback_completed",
+                                (request_id, "预计时长已结束（状态回读超时）", None),
+                            )
+                        )
+                    else:
+                        self.messages.put(
+                            (
+                                "playback_monitor_error",
+                                (request_id, f"IQR100回放完成状态监测失败：{exc}"),
+                            )
+                        )
                 else:
                     self.messages.put(
                         (
@@ -2243,18 +2273,9 @@ class PlaybackModule(ttk.Frame):
             if cancel_event.is_set():
                 return
             session.start(use_iqr=True, iqr_display_mode=settings.iqr_display_mode)
-            running_state, replayed_samples = session.wait_iqr_stream_active(
-                cancel_check=cancel_event.is_set
-            )
             if cancel_event.is_set():
                 session.stop(use_iqr=True)
                 return
-            run_mode = session.query_iqr_player_run_mode()
-            if "SING" not in run_mode.upper():
-                raise RuntimeError(
-                    f"场景队列要求每条记录以SINGle回放，设备回读{run_mode}。"
-                )
-            link_status = session.verify_smw_digital_iq_stream()
             if restore_rf:
                 session.set_rf(True)
             self.messages.put(
@@ -2263,8 +2284,8 @@ class PlaybackModule(ttk.Frame):
                     (
                         request_id,
                         smw_status,
-                        f"{iqr_status}｜启动状态：{running_state}｜"
-                        f"样本计数：{replayed_samples:g} Sa｜运行方式：{run_mode}｜{link_status}",
+                        f"{iqr_status}｜LAN触发命令已发送｜"
+                        "设备执行期间暂停IQR状态轮询，避免固件VISA超时",
                         restore_rf,
                     ),
                 )
@@ -2562,6 +2583,27 @@ class PlaybackModule(ttk.Frame):
                 self.device_status_var.set(str(payload))
                 self._log(f"设备配置完成：{payload}")
                 self._update_rf_button()
+            elif kind == "playback_triggered":
+                request_id, run_mode, expected_duration_s = payload  # type: ignore[misc]
+                if request_id != self.playback_request_id:
+                    continue
+                self.start_transitioning = False
+                self.playing = True
+                self.hardware_playback_active = True
+                self.device_status_var.set(
+                    f"IQR100已接受LAN回放触发｜运行方式：{run_mode}｜"
+                    f"预计单次时长：{expected_duration_s:.3f} s｜"
+                    "设备执行期间暂停状态查询，完成后自动更新"
+                )
+                self.play_status_var.set("IQR100正在执行回放，软件波形开始同步计时")
+                self.play_button.configure(text="暂停预览")
+                self._start_preview_clock()
+                self._log(
+                    f"IQR100 LAN触发命令已发送；运行方式{run_mode}；"
+                    "为兼容设备固件，回放期间不发送状态查询。"
+                )
+                if not self.play_after_id:
+                    self._advance_preview()
             elif kind == "playback_started":
                 request_id, player_state, run_mode, replayed_samples, link_status = payload  # type: ignore[misc]
                 if request_id != self.playback_request_id:
@@ -2619,15 +2661,20 @@ class PlaybackModule(ttk.Frame):
                 if self.current_result is not None:
                     self.draw_preview()
                 self.play_button.configure(text="重新预览")
+                sample_text = (
+                    f"{float(final_samples):g} Sa"
+                    if final_samples is not None
+                    else "设备未回读"
+                )
                 self.device_status_var.set(
                     f"IQR100单次回放已完成｜Player：{player_state}｜"
-                    f"最终样本计数：{final_samples:g} Sa｜可直接再次点击开始回放"
+                    f"最终样本计数：{sample_text}｜可直接再次点击开始回放"
                 )
                 self.play_status_var.set("IQR100单次回放已完成，可直接重新回放")
                 self.status_var.set("设备单次回放已完成。")
                 self._log(
                     f"IQR100单次回放已完成：Player={player_state}，"
-                    f"最终样本计数={final_samples:g} Sa；设备保持已配置状态。"
+                    f"最终样本计数={sample_text}；设备保持已配置状态。"
                 )
             elif kind == "playback_monitor_error":
                 request_id, error_text = payload  # type: ignore[misc]
