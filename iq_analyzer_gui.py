@@ -98,6 +98,7 @@ from scene_catalog import (
     list_linked_iq,
     list_linked_iq_details,
     list_scene_locations,
+    refresh_iq_link_paths,
     scene_filter_values,
     sync_association_locations,
     unlink_iq_recording,
@@ -2459,8 +2460,14 @@ class IQAnalyzerApp(tk.Tk):
             self._show_selected_scene_data()
 
     def refresh_recordings(self) -> None:
+        data_root = Path(self.data_dir.get())
+        path_refresh = None
         try:
-            self.recordings = discover_recordings(Path(self.data_dir.get()))
+            path_refresh = refresh_iq_link_paths(Path(self.feature_db_path.get()), data_root)
+        except Exception as exc:
+            self._log(f"场景IQ关联路径自动校正失败：{exc}")
+        try:
+            self.recordings = discover_recordings(data_root)
         except Exception as exc:
             messagebox.showerror("读取数据文件夹失败", str(exc))
             return
@@ -2475,6 +2482,21 @@ class IQAnalyzerApp(tk.Tk):
         if self.playback_tab is not None:
             self.playback_tab.configure_recording(self.selected_recording())
         self._log("已加载 IQ 数据组：\n" + "\n".join("  " + item.summary for item in self.recordings))
+        if path_refresh is not None and path_refresh.updated_count:
+            self.status_var.set(
+                f"已按新IQ根目录更新 {path_refresh.updated_count} 条场景关联路径。"
+            )
+            self._log(
+                f"场景IQ路径已自动更新 {path_refresh.updated_count} 条；"
+                f"未找到 {path_refresh.missing_count} 条；同名冲突 {path_refresh.ambiguous_count} 条。"
+            )
+            if self.device_playback_module is not None:
+                self.device_playback_module.refresh_raw_catalog()
+        elif path_refresh is not None and path_refresh.unresolved_stems:
+            self.status_var.set(
+                f"新IQ根目录中仍有 {len(path_refresh.unresolved_stems)} 组场景IQ未找到。"
+            )
+            self._log("未能重定位的IQ数据组：" + "、".join(path_refresh.unresolved_stems))
         if self.selected_scene_location is not None:
             self._show_selected_scene_data()
 

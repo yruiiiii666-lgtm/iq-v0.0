@@ -64,6 +64,16 @@ class IQLocationLink:
     ws2_file: str
 
 
+@dataclass(frozen=True)
+class IQPathRefreshResult:
+    total_count: int
+    valid_count: int
+    updated_count: int
+    missing_count: int
+    ambiguous_count: int
+    unresolved_stems: tuple[str, ...]
+
+
 ASSOCIATION_COLUMNS = (
     "序号",
     "城市",
@@ -320,6 +330,109 @@ def list_linked_iq_details(database_path: Path, city: str, point: str) -> list[I
             (city, point),
         ).fetchall()
         return [IQLocationLink(*row) for row in rows]
+    finally:
+        connection.close()
+
+
+def refresh_iq_link_paths(database_path: Path, iq_root: Path) -> IQPathRefreshResult:
+    """Relocate stale scene IQ links after the user changes the IQ root."""
+
+    root = Path(iq_root).expanduser().resolve()
+    connection = _connect(database_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT links.city, links.point, links.recording_stem,
+                   links.wsm_file, links.ws1_file, links.ws2_file,
+                   locations.iq_relative_directory
+            FROM iq_location_links AS links
+            JOIN scene_locations AS locations
+              ON locations.city=links.city AND locations.point=links.point
+            ORDER BY links.city, links.point, links.recording_stem
+            """
+        ).fetchall()
+        stale_rows = [
+            row
+            for row in rows
+            if not all(Path(value).is_file() for value in row[3:6] if value)
+            or not all(row[3:6])
+        ]
+        if not stale_rows:
+            return IQPathRefreshResult(len(rows), len(rows), 0, 0, 0, ())
+        if not root.is_dir():
+            stems = tuple(sorted({row[2] for row in stale_rows}, key=str.casefold))
+            return IQPathRefreshResult(len(rows), len(rows) - len(stale_rows), 0, len(stale_rows), 0, stems)
+
+        metadata_paths = {
+            *root.rglob("*.wsm"),
+            *root.rglob("*.WSM"),
+        }
+        complete_groups: dict[str, list[tuple[Path, Path, Path]]] = {}
+        for metadata_path in metadata_paths:
+            stem_key = metadata_path.stem.casefold()
+            siblings = {
+                path.suffix.casefold(): path
+                for path in metadata_path.parent.iterdir()
+                if path.is_file() and path.stem.casefold() == stem_key
+            }
+            if all(suffix in siblings for suffix in (".wsm", ".ws1", ".ws2")):
+                complete_groups.setdefault(stem_key, []).append(
+                    (siblings[".wsm"], siblings[".ws1"], siblings[".ws2"])
+                )
+
+        updated_count = 0
+        missing_count = 0
+        ambiguous_count = 0
+        unresolved: set[str] = set()
+        for city, point, stem, _old_wsm, _old_ws1, _old_ws2, relative_directory in stale_rows:
+            matches = complete_groups.get(stem.casefold(), [])
+            preferred_directories: list[Path] = []
+            relative = Path(relative_directory) if relative_directory and relative_directory != "." else Path()
+            if not relative.is_absolute():
+                preferred_directories.append((root / relative).resolve())
+                if relative != Path():
+                    if root.name.casefold() == relative.name.casefold():
+                        preferred_directories.append(root)
+                    preferred_directories.append((root.parent / relative).resolve())
+            preferred_keys = {str(path).casefold() for path in preferred_directories}
+            preferred_matches = [
+                group for group in matches if str(group[0].parent.resolve()).casefold() in preferred_keys
+            ]
+            if len(preferred_matches) == 1:
+                selected = preferred_matches[0]
+            elif not preferred_matches and len(matches) == 1:
+                selected = matches[0]
+            else:
+                selected = None
+
+            if selected is None:
+                unresolved.add(stem)
+                if len(matches) > 1 or len(preferred_matches) > 1:
+                    ambiguous_count += 1
+                else:
+                    missing_count += 1
+                continue
+            connection.execute(
+                """
+                UPDATE iq_location_links
+                SET wsm_file=?, ws1_file=?, ws2_file=?, linked_at=?
+                WHERE city=? AND point=? AND recording_stem=?
+                """,
+                (
+                    str(selected[0]), str(selected[1]), str(selected[2]),
+                    datetime.now().isoformat(timespec="seconds"), city, point, stem,
+                ),
+            )
+            updated_count += 1
+        connection.commit()
+        return IQPathRefreshResult(
+            total_count=len(rows),
+            valid_count=len(rows) - len(stale_rows),
+            updated_count=updated_count,
+            missing_count=missing_count,
+            ambiguous_count=ambiguous_count,
+            unresolved_stems=tuple(sorted(unresolved, key=str.casefold)),
+        )
     finally:
         connection.close()
 
