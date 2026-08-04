@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -156,6 +158,28 @@ class PlaybackPackage:
 
 def safe_waveform_name(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", value).strip("._") or "playback"
+
+
+def safe_instrument_waveform_name(value: str, max_length: int = 48) -> str:
+    """Build a deterministic ASCII-only filename for an R&S instrument.
+
+    Local package paths may retain Chinese names, but the SMBV100A remote file
+    command is an ASCII SCPI header.  A short hash preserves uniqueness when
+    transliteration removes some or all non-ASCII characters.
+    """
+
+    source = str(value).strip() or "playback"
+    normalized = unicodedata.normalize("NFKD", source)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    ascii_name = re.sub(r"[^0-9A-Za-z._-]+", "_", ascii_text).strip("._")
+    contains_non_ascii = any(ord(character) > 127 for character in source)
+    if contains_non_ascii:
+        digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:10]
+        base_limit = max(1, max_length - len(digest) - 1)
+        ascii_name = f"{(ascii_name or 'waveform')[:base_limit]}_{digest}"
+    else:
+        ascii_name = ascii_name or "playback"
+    return ascii_name[:max_length].strip("._") or "playback"
 
 
 def validate_playback_settings(result: ReconstructionResult, settings: PlaybackSettings) -> tuple[str, ...]:
@@ -348,7 +372,7 @@ class VisaPlaybackSession:
     ) -> str:
         if self.smw is None:
             raise RuntimeError("SMBV100A尚未连接。")
-        instrument_name = safe_waveform_name(package.waveform_file.stem) + ".wv"
+        instrument_name = safe_instrument_waveform_name(package.waveform_file.stem) + ".wv"
         remote_path = f"/var/user/{instrument_name}"
         payload = package.waveform_file.read_bytes()
         command = f"MMEMory:DATA '{remote_path}',".encode("ascii") + ieee_block(payload) + b"\n"
