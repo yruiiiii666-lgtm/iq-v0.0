@@ -16,7 +16,13 @@ from tkinter import filedialog, messagebox, ttk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
-from scene_catalog import SCENE_TYPES, IQLocationLink, list_linked_iq_details, list_scene_locations
+from scene_catalog import (
+    SCENE_TYPES,
+    IQLocationLink,
+    list_linked_iq_details,
+    list_scene_locations,
+    resolve_linked_iq_detail,
+)
 from signal_reconstruction import (
     LocationSpectrumIQSummary,
     ReconstructionResult,
@@ -42,7 +48,7 @@ from signal_reconstruction import (
     select_scene_iq_representatives,
 )
 from spectrum_feature_library import ALL_BAND, FEATURE_BANDS
-from iq_reader import recording_from_paths
+from iq_reader import IQRecording, recording_from_paths
 from runtime_paths import application_dir
 
 
@@ -542,6 +548,11 @@ class ReconstructionModule(ttk.Frame):
         if row is None:
             messagebox.showinfo("尚未选择", "请先在“代表频段/最强片段”表中选择一行。")
             return
+        try:
+            self.resolve_representative_recording(row)
+        except ValueError as exc:
+            messagebox.showerror("实采背景不可用", str(exc))
+            return
         self.complex_base_representative = row
         self.complex_base_text.set(f"实采背景：{row.scene_type}｜{row.point}｜{row.recording_stem}")
         self.center_var.set(f"{row.center_frequency_mhz:g}")
@@ -550,6 +561,43 @@ class ReconstructionModule(ttk.Frame):
         self.measured_source_duration_var.set(f"{row.selected_duration_s * 1e3:.6f}")
         self.complex_duration_var.set("1000")
         self.name_var.set(f"{row.scene_type}_{row.representative_frequency_mhz:g}MHz_复杂场景")
+
+    def resolve_representative_recording(self, row: SceneIQRepresentative) -> IQRecording:
+        """Resolve cached representative paths against the current scene IQ root."""
+        iq_root = None
+        if self.iq_root_var is not None and self.iq_root_var.get().strip():
+            iq_root = Path(self.iq_root_var.get())
+        try:
+            link = resolve_linked_iq_detail(
+                Path(self.database_var.get()),
+                row.city,
+                row.point,
+                row.recording_stem,
+                iq_root,
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"无法按场景分类中选择的 IQ 路径定位“{row.recording_stem}”：{exc}"
+            ) from exc
+        if link is None:
+            root_text = str(iq_root) if iq_root is not None else "尚未选择"
+            raise ValueError(
+                f"在当前场景关联和 IQ 根目录中找不到完整数据组“{row.recording_stem}”。\n"
+                f"场景：{row.city} / {row.point}\n"
+                f"当前 IQ 根目录：{root_text}\n"
+                "请在“场景分类”中确认数据路径，并保证同名 .wsm、.ws1、.ws2 文件完整。"
+            )
+        try:
+            recording = recording_from_paths(
+                link.recording_stem,
+                Path(link.wsm_file),
+                (Path(link.ws1_file), Path(link.ws2_file)),
+            )
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise ValueError(f"无法读取场景关联 IQ“{row.recording_stem}”：{exc}") from exc
+        if self.location_var.get() == f"{row.city}/{row.point}":
+            self.current_links[row.recording_stem] = link
+        return recording
 
     def _build_selection_results(self, parent: ttk.Frame) -> None:
         self.notebook = ttk.Notebook(parent)
@@ -1463,11 +1511,7 @@ class ReconstructionModule(ttk.Frame):
                 representative = self.complex_base_representative
                 if representative is None:
                     raise ValueError("请先在“代表频段/最强片段”表选择一行，并设为复杂场景实采背景")
-                recording = recording_from_paths(
-                    representative.recording_stem,
-                    Path(representative.wsm_file),
-                    (Path(representative.ws1_file), Path(representative.ws2_file)),
-                )
+                recording = self.resolve_representative_recording(representative)
                 parameters = (
                     common["name"], recording, float(self.measured_start_var.get()),
                     float(self.measured_source_duration_var.get()) * 1e-3, common["duration"],
@@ -1477,7 +1521,7 @@ class ReconstructionModule(ttk.Frame):
                 )
             else:
                 raise ValueError("未知重构方式")
-        except ValueError as exc:
+        except (FileNotFoundError, OSError, ValueError) as exc:
             messagebox.showerror("重构参数无效", str(exc))
             return
         self._busy(True, f"正在执行{mode}...")

@@ -334,6 +334,49 @@ def list_linked_iq_details(database_path: Path, city: str, point: str) -> list[I
         connection.close()
 
 
+def resolve_linked_iq_detail(
+    database_path: Path,
+    city: str,
+    point: str,
+    recording_stem: str,
+    iq_root: Path | None = None,
+) -> IQLocationLink | None:
+    """Return the current usable path set for one scene-linked IQ recording.
+
+    Representative-IQ analysis results are cached and therefore can contain an
+    absolute path from a previous computer or drive.  The scene link table is
+    the authoritative source: when its paths are stale too, relocate all stale
+    links below the IQ root currently selected in the scene-classification UI.
+    """
+
+    def find_link() -> IQLocationLink | None:
+        return next(
+            (
+                link
+                for link in list_linked_iq_details(database_path, city, point)
+                if link.recording_stem.casefold() == recording_stem.casefold()
+            ),
+            None,
+        )
+
+    link = find_link()
+    if link is not None and all(
+        value and Path(value).is_file()
+        for value in (link.wsm_file, link.ws1_file, link.ws2_file)
+    ):
+        return link
+
+    if iq_root is not None:
+        refresh_iq_link_paths(database_path, iq_root)
+        link = find_link()
+        if link is not None and all(
+            value and Path(value).is_file()
+            for value in (link.wsm_file, link.ws1_file, link.ws2_file)
+        ):
+            return link
+    return None
+
+
 def refresh_iq_link_paths(database_path: Path, iq_root: Path) -> IQPathRefreshResult:
     """Relocate stale scene IQ links after the user changes the IQ root."""
 

@@ -2565,11 +2565,10 @@ class IQAnalyzerApp(tk.Tk):
         representative = self._selected_reconstruction_representative()
         if representative is not None:
             try:
-                return recording_from_paths(
-                    representative.recording_stem,
-                    Path(representative.wsm_file),
-                    (Path(representative.ws1_file), Path(representative.ws2_file)),
-                )
+                module = self.reconstruction_module
+                if module is None:
+                    raise ValueError("信号重构模块尚未初始化")
+                return module.resolve_representative_recording(representative)
             except Exception as exc:
                 raise ValueError(
                     f"无法读取当前选中场景代表 IQ“{representative.recording_stem}”：{exc}"
