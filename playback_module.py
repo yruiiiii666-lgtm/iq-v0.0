@@ -594,6 +594,7 @@ class PlaybackModule(ttk.Frame):
             text="开始回放",
             style="Success.TButton",
             command=self.start_playback,
+            state=tk.DISABLED,
         )
         self.start_button.pack(side=tk.LEFT, padx=5)
         self.pause_button = ttk.Button(
@@ -1543,6 +1544,9 @@ class PlaybackModule(ttk.Frame):
             and (not package_required or self.current_package is not None)
         )
         self.send_button.configure(state=tk.NORMAL if send_ready else tk.DISABLED)
+        if hasattr(self, "start_button"):
+            start_ready = source_ready and self.device_configured
+            self.start_button.configure(state=tk.NORMAL if start_ready else tk.DISABLED)
         if hasattr(self, "prepare_button"):
             prepare_ready = source_ready and not self._is_raw_mode() and not self.simulation_var.get()
             self.prepare_button.configure(state=tk.NORMAL if prepare_ready else tk.DISABLED)
@@ -1829,7 +1833,9 @@ class PlaybackModule(ttk.Frame):
         except ValueError as exc:
             messagebox.showerror("设备参数无效", str(exc))
             return
+        self.device_configured = False
         self.device_status_var.set("正在发送波形并配置设备；RF保持关闭...")
+        self._update_action_states()
         self._update_rf_button()
         threading.Thread(
             target=self._send_worker,
@@ -2097,7 +2103,14 @@ class PlaybackModule(ttk.Frame):
         except Exception as exc:
             messagebox.showerror("停止失败", str(exc))
             return
-        stopped_text = "准备已取消，波形未播放" if was_preparing else "回放已停止"
+        self.device_configured = False
+        self._update_action_states()
+        self._update_rf_button()
+        stopped_text = (
+            "准备已取消，需重新发送并配置设备"
+            if was_preparing
+            else "回放已停止，需重新发送并配置设备"
+        )
         self.play_status_var.set(stopped_text)
         self.status_var.set(stopped_text + "。")
         self._log("IQR100准备已取消，回放已停止。" if was_preparing else "回放已停止。")
@@ -2108,6 +2121,7 @@ class PlaybackModule(ttk.Frame):
                 detail = "仿真回放已停止。"
             else:
                 detail = "已向设备发送停止命令，当前回放已停止。"
+            detail += "\n\n如需再次回放，请先点击“发送波形并配置设备”。"
             if self.rf_enabled:
                 detail += "\n\n注意：RF输出仍处于开启状态，请根据需要单独关闭。"
                 messagebox.showwarning("回放已停止", detail)
@@ -2745,6 +2759,7 @@ class PlaybackModule(ttk.Frame):
                 self._log(f"设备配置完成：{payload}")
                 if not self.simulation_var.get():
                     self._apply_rf_state(False, source="configuration")
+                self._update_action_states()
                 self._update_rf_button()
             elif kind == "rf_status":
                 session, enabled = payload  # type: ignore[misc]
