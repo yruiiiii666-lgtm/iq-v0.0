@@ -72,6 +72,9 @@ class PlaybackModule(ttk.Frame):
         self.device_identities = ("未连接", "未连接")
         self.smw_identity_var = tk.StringVar(value="未连接")
         self.iqr_identity_var = tk.StringVar(value="未连接")
+        self.device_summary_var = tk.StringVar(value="未连接")
+        self.smw_status_detail_var = tk.StringVar(value="等待连接")
+        self.iqr_status_detail_var = tk.StringVar(value="当前链路不使用 IQR100")
         self.device_details_window: tk.Toplevel | None = None
         self.popup_iqr_address_entry: ttk.Entry | None = None
         self.popup_iqr_path_entry: ttk.Entry | None = None
@@ -150,6 +153,8 @@ class PlaybackModule(ttk.Frame):
                 self.external_reference_var.set(bool(validated["external_reference"]))
 
         self._build_ui()
+        self.device_status_var.trace_add("write", self._sync_device_status_display)
+        self._sync_device_status_display()
         self._on_playback_mode_changed(announce=False)
         if self.verified_device_profile is not None:
             self.device_status_var.set(
@@ -338,14 +343,44 @@ class PlaybackModule(ttk.Frame):
 
     def _build_device_area(self, parent: ttk.Frame) -> ttk.LabelFrame:
         device = ttk.LabelFrame(parent, text="设备连接状态", style="Card.TLabelframe", padding=10)
+        self.device_area = device
+
         ttk.Label(device, text="当前链路", foreground="#64748b").pack(anchor="w")
-        ttk.Label(
-            device, textvariable=self.route_var, wraplength=280, justify=tk.LEFT
-        ).pack(fill=tk.X, anchor="w", pady=(1, 6))
-        ttk.Label(
-            device, textvariable=self.device_status_var, foreground="#0f172a",
-            wraplength=280, justify=tk.LEFT,
-        ).pack(fill=tk.X, anchor="w", pady=(0, 6))
+        self.device_route_label = ttk.Label(
+            device,
+            textvariable=self.route_var,
+            font=("Segoe UI", 10, "bold"),
+            wraplength=280,
+            justify=tk.LEFT,
+        )
+        self.device_route_label.pack(fill=tk.X, anchor="w", pady=(1, 7))
+
+        ttk.Separator(device, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 7))
+        ttk.Label(device, text="当前状态", foreground="#64748b").pack(anchor="w")
+        self.device_summary_label = ttk.Label(
+            device,
+            textvariable=self.device_summary_var,
+            foreground="#0f172a",
+            wraplength=280,
+            justify=tk.LEFT,
+        )
+        self.device_summary_label.pack(fill=tk.X, anchor="w", pady=(1, 8))
+
+        self.smw_status_card = self._build_device_status_card(
+            device,
+            "SMBV100A",
+            self.smw_identity_var,
+            self.smw_status_detail_var,
+        )
+        self.smw_status_card.pack(fill=tk.X, pady=(0, 7))
+        self.iqr_status_card = self._build_device_status_card(
+            device,
+            "IQR100",
+            self.iqr_identity_var,
+            self.iqr_status_detail_var,
+        )
+        self.iqr_status_card.pack(fill=tk.X, pady=(0, 8))
+
         ttk.Checkbutton(
             device,
             text="离线仿真（不连接设备）",
@@ -361,7 +396,122 @@ class PlaybackModule(ttk.Frame):
         self.disconnect_button = ttk.Button(buttons, text="断开", command=self.disconnect_devices)
         self.disconnect_button.pack(side=tk.LEFT)
         self.route_var.trace_add("write", lambda *_args: self._update_route_state())
+        device.bind("<Configure>", self._resize_device_status_labels, add="+")
         return device
+
+    def _build_device_status_card(
+        self,
+        parent: ttk.Frame,
+        title: str,
+        identity_var: tk.StringVar,
+        detail_var: tk.StringVar,
+    ) -> ttk.LabelFrame:
+        card = ttk.LabelFrame(
+            parent,
+            text=title,
+            style="Card.TLabelframe",
+            padding=(8, 5, 8, 7),
+        )
+        identity_label = ttk.Label(
+            card,
+            textvariable=identity_var,
+            foreground="#64748b",
+            font=("Segoe UI", 9),
+            wraplength=250,
+            justify=tk.LEFT,
+        )
+        identity_label.pack(fill=tk.X, anchor="w")
+        ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(5, 5))
+        detail_label = ttk.Label(
+            card,
+            textvariable=detail_var,
+            foreground="#0f172a",
+            font=("Segoe UI", 9),
+            wraplength=250,
+            justify=tk.LEFT,
+        )
+        detail_label.pack(fill=tk.X, anchor="w")
+        if not hasattr(self, "device_status_wrap_labels"):
+            self.device_status_wrap_labels: list[ttk.Label] = []
+        self.device_status_wrap_labels.extend((identity_label, detail_label))
+        return card
+
+    def _resize_device_status_labels(self, event: tk.Event) -> None:
+        if event.widget is not self.device_area:
+            return
+        outer_wrap = max(180, event.width - 28)
+        inner_wrap = max(160, event.width - 50)
+        self.device_route_label.configure(wraplength=outer_wrap)
+        self.device_summary_label.configure(wraplength=outer_wrap)
+        for label in self.device_status_wrap_labels:
+            label.configure(wraplength=inner_wrap)
+
+    @staticmethod
+    def _format_device_status_detail(text: str) -> str:
+        return "\n".join(part.strip() for part in text.split("｜") if part.strip())
+
+    def _sync_device_status_display(self, *_args: object) -> None:
+        text = self.device_status_var.get().strip() or "未连接"
+        summary = text
+
+        smw_marker = "SMBV100A:"
+        iqr_marker = "｜IQR100:"
+        if text.startswith(smw_marker) and iqr_marker in text:
+            smw_text, iqr_text = text[len(smw_marker):].split(iqr_marker, 1)
+            self.smw_status_detail_var.set(self._format_device_status_detail(smw_text))
+            self.iqr_status_detail_var.set(self._format_device_status_detail(iqr_text))
+            summary = "两台设备已配置完成，RF保持关闭。"
+        elif text.startswith(("IQR100实际数据流已启动", "IQR100单次回放已完成")):
+            parts = [part.strip() for part in text.split("｜") if part.strip()]
+            summary = parts[0]
+            if len(parts) > 1:
+                self.iqr_status_detail_var.set("\n".join(parts[1:]))
+        elif text.startswith("已连接"):
+            self.smw_status_detail_var.set("连接正常，等待发送配置。")
+            self.iqr_status_detail_var.set(
+                "连接正常，等待发送配置。"
+                if self.route_var.get() == ROUTE_IQR
+                else "当前链路不使用 IQR100"
+            )
+        elif text.startswith("正在连接"):
+            self.smw_status_detail_var.set("正在建立 VISA 会话并读取设备标识…")
+            self.iqr_status_detail_var.set(
+                "正在建立 VISA 会话并读取记录目录…"
+                if self.route_var.get() == ROUTE_IQR
+                else "当前链路不使用 IQR100"
+            )
+        elif text.startswith("正在发送波形并配置设备"):
+            self.smw_status_detail_var.set("正在配置频率、电平和数字 IQ 输入…")
+            self.iqr_status_detail_var.set(
+                "正在选择记录并配置 Player…"
+                if self.route_var.get() == ROUTE_IQR
+                else "当前链路不使用 IQR100"
+            )
+        elif "离线仿真" in text:
+            self.smw_status_detail_var.set("仿真模式，不建立硬件连接。")
+            self.iqr_status_detail_var.set("仿真模式，不建立硬件连接。")
+        elif "未连接" in text or text.startswith("设备已断开"):
+            self.smw_status_detail_var.set("等待连接")
+            self.iqr_status_detail_var.set(
+                "等待连接" if self.route_var.get() == ROUTE_IQR else "当前链路不使用 IQR100"
+            )
+        elif "失败" in text or "错误" in text:
+            if "IQR" in text:
+                self.iqr_status_detail_var.set(self._format_device_status_detail(text))
+            elif "SMBV" in text:
+                self.smw_status_detail_var.set(self._format_device_status_detail(text))
+
+        self.device_summary_var.set(summary)
+        if hasattr(self, "device_summary_label"):
+            if "失败" in text or "错误" in text:
+                color = "#b91c1c"
+            elif text.startswith("正在") or "等待" in text:
+                color = "#1d4ed8"
+            elif self.connected or "完成" in summary or "已启动" in summary:
+                color = "#15803d"
+            else:
+                color = "#475569"
+            self.device_summary_label.configure(foreground=color)
 
     def _build_output_area(self, parent: ttk.Frame) -> ttk.LabelFrame:
         output = ttk.LabelFrame(parent, text="输出参数设置", style="Card.TLabelframe", padding=8)
@@ -1255,6 +1405,7 @@ class PlaybackModule(ttk.Frame):
             )
         if self._is_raw_mode():
             self._update_iqr_match_feedback(self.raw_recording or self._selected_raw_recording())
+        self._sync_device_status_display()
         self._update_action_states()
 
     def _on_simulation_toggled(self, announce: bool = True) -> None:
@@ -1672,6 +1823,23 @@ class PlaybackModule(ttk.Frame):
         )
         display_mode = "FFT" if self.iqr_display_var.get() == IQR_DISPLAY_FFT else "IQ"
         if use_hardware_iqr:
+            assert self.session is not None
+            resume_paused_cycle = self.session.iqr_paused
+            if not resume_paused_cycle:
+                self.preview_elapsed_origin_ms = 0.0
+                self.display_elapsed_ms = 0.0
+                self.position_ms_var.set(0.0)
+                self._reset_preview_trend()
+                self.draw_preview()
+            try:
+                expected_duration_s = max(0.001, float(self.duration_var.get()) * 1e-3)
+            except ValueError:
+                expected_duration_s = max(0.001, self.current_result.duration_s)
+            watch_single_completion = (
+                not resume_paused_cycle
+                and not self.loop_enabled_var.get()
+                and not self._is_raw_sequence_mode()
+            )
             request_id, cancel_event = self._begin_playback_operation()
             self.start_transitioning = True
             self.playing = False
@@ -1688,13 +1856,14 @@ class PlaybackModule(ttk.Frame):
                 "IQR100正在准备回放；设备进入Running且硬件样本计数增长前，"
                 "软件波形和计时保持静止。"
             )
-            assert self.session is not None
             threading.Thread(
                 target=self._start_iqr_worker,
                 args=(
                     self.session,
                     display_mode,
                     self.loop_enabled_var.get() and not self._is_raw_sequence_mode(),
+                    watch_single_completion,
+                    expected_duration_s + 120.0,
                     request_id,
                     cancel_event,
                 ),
@@ -1733,6 +1902,8 @@ class PlaybackModule(ttk.Frame):
         session: VisaPlaybackSession,
         display_mode: str,
         expected_continuous: bool,
+        watch_single_completion: bool,
+        completion_timeout_s: float,
         request_id: int,
         cancel_event: threading.Event,
     ) -> None:
@@ -1760,6 +1931,28 @@ class PlaybackModule(ttk.Frame):
                     (request_id, state, run_mode, replayed_samples, link_status),
                 )
             )
+            if watch_single_completion:
+                try:
+                    completed_state, final_samples = session.wait_iqr_player_complete(
+                        timeout_s=completion_timeout_s,
+                        cancel_check=cancel_event.is_set,
+                    )
+                except InterruptedError:
+                    return
+                except Exception as exc:
+                    self.messages.put(
+                        (
+                            "playback_monitor_error",
+                            (request_id, f"IQR100回放完成状态监测失败：{exc}"),
+                        )
+                    )
+                else:
+                    self.messages.put(
+                        (
+                            "playback_completed",
+                            (request_id, completed_state, final_samples),
+                        )
+                    )
         except InterruptedError:
             try:
                 session.stop(use_iqr=True)
@@ -2401,6 +2594,47 @@ class PlaybackModule(ttk.Frame):
                 self.play_status_var.set("设备实际数据流未启动，软件波形未播放")
                 self._log(str(error_text))
                 messagebox.showerror("IQR100启动失败", str(error_text))
+            elif kind == "playback_completed":
+                request_id, player_state, final_samples = payload  # type: ignore[misc]
+                if request_id != self.playback_request_id:
+                    continue
+                self.start_transitioning = False
+                self.playing = False
+                self.hardware_playback_active = False
+                self.preview_clock_started_at = None
+                if self.play_after_id is not None:
+                    self.after_cancel(self.play_after_id)
+                    self.play_after_id = None
+                try:
+                    completed_ms = max(0.001, float(self.duration_var.get()))
+                except ValueError:
+                    completed_ms = (
+                        max(0.001, self.current_result.duration_s * 1e3)
+                        if self.current_result
+                        else 0.001
+                    )
+                self.display_elapsed_ms = completed_ms
+                self.preview_elapsed_origin_ms = completed_ms
+                self.position_ms_var.set(completed_ms)
+                if self.current_result is not None:
+                    self.draw_preview()
+                self.play_button.configure(text="重新预览")
+                self.device_status_var.set(
+                    f"IQR100单次回放已完成｜Player：{player_state}｜"
+                    f"最终样本计数：{final_samples:g} Sa｜可直接再次点击开始回放"
+                )
+                self.play_status_var.set("IQR100单次回放已完成，可直接重新回放")
+                self.status_var.set("设备单次回放已完成。")
+                self._log(
+                    f"IQR100单次回放已完成：Player={player_state}，"
+                    f"最终样本计数={final_samples:g} Sa；设备保持已配置状态。"
+                )
+            elif kind == "playback_monitor_error":
+                request_id, error_text = payload  # type: ignore[misc]
+                if request_id != self.playback_request_id:
+                    continue
+                self._log(str(error_text))
+                self.device_status_var.set(str(error_text))
             elif kind == "sequence_started":
                 request_id, smw_status, iqr_status, restored_rf = payload  # type: ignore[misc]
                 if request_id != self.playback_request_id:

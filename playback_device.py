@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import re
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -298,6 +299,11 @@ class VisaPlaybackSession:
         self.iqr = None
         self._iqr_paused = False
         self._iqr_display_mode = "IQ"
+        self._iqr_lock = threading.RLock()
+
+    @property
+    def iqr_paused(self) -> bool:
+        return self._iqr_paused
 
     def _open(self, address: str):
         import pyvisa
@@ -482,7 +488,8 @@ class VisaPlaybackSession:
         deadline = time.monotonic() + timeout_s
         state = ""
         while time.monotonic() < deadline:
-            state = str(self.iqr.query("TRIGger:PLAYer:STATe?")).strip()
+            with self._iqr_lock:
+                state = str(self.iqr.query("TRIGger:PLAYer:STATe?")).strip()
             if "please wait" not in state.casefold():
                 return state
             time.sleep(0.2)
@@ -491,12 +498,14 @@ class VisaPlaybackSession:
     def query_iqr_player_state(self) -> str:
         if self.iqr is None:
             raise RuntimeError("IQW/IQR记录仪尚未连接。")
-        return str(self.iqr.query("TRIGger:PLAYer:STATe?")).strip()
+        with self._iqr_lock:
+            return str(self.iqr.query("TRIGger:PLAYer:STATe?")).strip()
 
     def query_iqr_player_run_mode(self) -> str:
         if self.iqr is None:
             raise RuntimeError("IQW/IQR记录仪尚未连接。")
-        response = str(self.iqr.query("TRIGger:PLAYer:MODE?")).strip()
+        with self._iqr_lock:
+            response = str(self.iqr.query("TRIGger:PLAYer:MODE?")).strip()
         upper = response.upper()
         if "CONT" in upper:
             return "CONTinuous"
@@ -508,8 +517,9 @@ class VisaPlaybackSession:
         if self.iqr is None:
             raise RuntimeError("IQW/IQR记录仪尚未连接。")
         requested = "CONTinuous" if continuous else "SINGle"
-        self.iqr.write(f"TRIGger:PLAYer:MODE {requested}")
-        active = self.query_iqr_player_run_mode()
+        with self._iqr_lock:
+            self.iqr.write(f"TRIGger:PLAYer:MODE {requested}")
+            active = self.query_iqr_player_run_mode()
         expected_prefix = "CONT" if continuous else "SING"
         if expected_prefix not in active.upper():
             raise RuntimeError(
@@ -557,11 +567,40 @@ class VisaPlaybackSession:
     def query_iqr_replayed_samples(self) -> float:
         if self.iqr is None:
             raise RuntimeError("IQW/IQR记录仪尚未连接。")
-        response = str(self.iqr.query("OUTPut:IQ:SAMPles?")).strip()
+        with self._iqr_lock:
+            response = str(self.iqr.query("OUTPut:IQ:SAMPles?")).strip()
         try:
             return float(response)
         except ValueError as exc:
             raise RuntimeError(f"IQR回放样本计数无法解析：{response!r}") from exc
+
+    def wait_iqr_player_complete(
+        self,
+        timeout_s: float,
+        poll_interval_s: float = 0.25,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> tuple[str, float]:
+        """Wait for a started single replay cycle to return to an idle trigger state."""
+
+        deadline = time.monotonic() + max(1.0, timeout_s)
+        state = ""
+        while time.monotonic() < deadline:
+            if cancel_check is not None and cancel_check():
+                raise InterruptedError("IQR单次回放完成监测已取消。")
+            state = self.query_iqr_player_state()
+            normalized = " ".join(state.casefold().split())
+            if (
+                normalized == "ready"
+                or normalized.startswith("waiting for lan remote trigger")
+                or normalized.startswith("press \"play\\rec\" button to start")
+            ):
+                samples = self.query_iqr_replayed_samples()
+                self.logger(f"IQR Player单次回放完成：{state}｜{samples:g} Sa。")
+                return state, samples
+            if "error" in normalized or "failed" in normalized:
+                raise RuntimeError(f"IQR Player单次回放异常结束：{state}")
+            time.sleep(max(0.05, poll_interval_s))
+        raise TimeoutError(f"等待IQR单次回放完成超时，最后状态：{state or '无响应'}")
 
     def wait_iqr_stream_active(
         self,
@@ -616,8 +655,9 @@ class VisaPlaybackSession:
         normalized = display_mode.strip().upper()
         if normalized not in ("IQ", "FFT"):
             raise ValueError("IQR Player显示模式必须是IQ或FFT。")
-        self.iqr.write(f"MEASure:SPECtrum:PLAYer:MODE {normalized}")
-        self._iqr_display_mode = normalized
+        with self._iqr_lock:
+            self.iqr.write(f"MEASure:SPECtrum:PLAYer:MODE {normalized}")
+            self._iqr_display_mode = normalized
         self.logger(f"IQR Player屏幕显示已切换为{'I/Q波形' if normalized == 'IQ' else 'FFT频谱'}。")
         return normalized
 
@@ -680,21 +720,32 @@ class VisaPlaybackSession:
         if use_iqr:
             if self.iqr is None:
                 raise RuntimeError("IQW/IQR记录仪尚未连接。")
-            self.set_iqr_player_display_mode(iqr_display_mode)
-            command = "TRIGger:PLAYer:STARt" if self._iqr_paused else "TRIGger:PLAYer:EXECute"
-            self.iqr.write(command)
-            self._iqr_paused = False
+            with self._iqr_lock:
+                self.set_iqr_player_display_mode(iqr_display_mode)
+                if self._iqr_paused:
+                    self.iqr.write("TRIGger:PLAYer:STARt")
+                else:
+                    # A completed SINGle cycle may leave the trigger system
+                    # disarmed. Re-arm every fresh cycle before sending the LAN
+                    # trigger event so replay can be started repeatedly without
+                    # reloading the waveform.
+                    self.iqr.write("TRIGger:PLAYer:ARM ON")
+                    self._wait_iqr_player_ready()
+                    self.iqr.write("TRIGger:PLAYer:EXECute")
+                self._iqr_paused = False
         self.logger("回放已启动；RF是否打开由独立安全联锁控制。")
 
     def pause(self, use_iqr: bool = False) -> None:
         if use_iqr and self.iqr is not None:
-            self.iqr.write("TRIGger:PLAYer:PAUSe")
-            self._iqr_paused = True
+            with self._iqr_lock:
+                self.iqr.write("TRIGger:PLAYer:PAUSe")
+                self._iqr_paused = True
 
     def stop(self, use_iqr: bool = False) -> None:
         if use_iqr and self.iqr is not None:
-            self.iqr.write("TRIGger:PLAYer:STOP")
-            self._iqr_paused = False
+            with self._iqr_lock:
+                self.iqr.write("TRIGger:PLAYer:STOP")
+                self._iqr_paused = False
 
     def set_rf(self, enabled: bool) -> None:
         if self.smw is None:
