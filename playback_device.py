@@ -517,24 +517,6 @@ class VisaPlaybackSession:
             f"最后状态：{state or '无响应'}"
         )
 
-    def _wait_iqr_player_disarmed(self, timeout_s: float = 15.0) -> str:
-        """Wait for ARM OFF to finish before starting a fresh arm cycle."""
-
-        assert self.iqr is not None
-        deadline = time.monotonic() + timeout_s
-        state = ""
-        while time.monotonic() < deadline:
-            state = self.query_iqr_player_state()
-            normalized = " ".join(state.casefold().split())
-            if normalized == "ready":
-                return state
-            if "error" in normalized or "failed" in normalized:
-                raise RuntimeError(f"IQR Player解除武装失败，设备状态：{state}")
-            time.sleep(0.1)
-        raise TimeoutError(
-            f"等待IQR解除武装超时，最后状态：{state or '无响应'}"
-        )
-
     @staticmethod
     def _parse_iqr_player_state(response: object) -> str:
         """Return the readable state from an IQR SCPI string response.
@@ -783,17 +765,20 @@ class VisaPlaybackSession:
                 if self._iqr_paused:
                     self.iqr.write("TRIGger:PLAYer:STARt")
                 else:
-                    # A completed SINGle cycle may leave the trigger system
-                    # between Ready and the LAN wait state.  Explicitly reset
-                    # the arm latch and wait for the *actual* armed state before
-                    # EXECute; otherwise a fast second click can send EXECute
-                    # while the recorder still reports Ready and the event is
-                    # silently lost.
-                    self.iqr.write("TRIGger:PLAYer:ARM OFF")
-                    self._wait_iqr_player_disarmed()
-                    self.iqr.write("TRIGger:PLAYer:SOURce LAN")
-                    self.iqr.write("TRIGger:PLAYer:ARM ON")
-                    armed_state = self._wait_iqr_player_armed_for_lan()
+                    # Loading a recording already leaves the IQR armed and
+                    # waiting for the LAN trigger.  Do not disarm that first
+                    # cycle: doing so can make the following EXECute event get
+                    # lost.  After a completed SINGle cycle the state is Ready;
+                    # only that branch needs ARM ON followed by an explicit
+                    # wait for the LAN-trigger state.
+                    current_state = self.query_iqr_player_state()
+                    normalized = " ".join(current_state.casefold().split())
+                    if normalized.startswith("waiting for lan remote trigger"):
+                        armed_state = current_state
+                    else:
+                        self.iqr.write("TRIGger:PLAYer:SOURce LAN")
+                        self.iqr.write("TRIGger:PLAYer:ARM ON")
+                        armed_state = self._wait_iqr_player_armed_for_lan()
                     self.logger(f"IQR Player已等待LAN触发：{armed_state}。")
                     self.iqr.write("TRIGger:PLAYer:EXECute")
                 self._iqr_paused = False
