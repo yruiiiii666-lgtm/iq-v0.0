@@ -11,11 +11,12 @@ import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 
-from signal_reconstruction import ReconstructionResult
+if TYPE_CHECKING:
+    from signal_reconstruction import ReconstructionResult
 
 
 HARD_MAX_DIGITAL_PEAK_DBFS = 0.0
@@ -542,6 +543,48 @@ class VisaPlaybackSession:
             f"最后状态：{state or '无响应'}"
         )
 
+    def _wait_iqr_player_disarmed(self, timeout_s: float = 15.0) -> str:
+        """Wait until STOP/ARM OFF has returned the player to Ready."""
+
+        assert self.iqr is not None
+        deadline = time.monotonic() + timeout_s
+        state = ""
+        previous_state = ""
+        while time.monotonic() < deadline:
+            state = self.query_iqr_player_state()
+            if state != previous_state:
+                self.logger(f"IQR Player解除武装状态：{state or '空响应'}")
+                previous_state = state
+            normalized = " ".join(state.casefold().split())
+            if normalized == "ready":
+                return state
+            if "error" in normalized or "failed" in normalized:
+                raise RuntimeError(f"IQR Player解除武装失败，设备状态：{state}")
+            time.sleep(0.1)
+        raise TimeoutError(
+            f"等待IQR停止并解除武装超时，最后状态：{state or '无响应'}"
+        )
+
+    def reset_iqr_player_for_recording_switch(self, timeout_s: float = 15.0) -> str:
+        """Clear the previous one-shot trigger latch before loading another file.
+
+        On IQR firmware 04.10.x, STOP can leave the LAN trigger system armed.  A
+        following ``ARM ON`` is then not a new arm edge and the next EXECute
+        event can be ignored even though the front panel says it is waiting for
+        a LAN command.  Force OFF and wait for Ready before selecting the next
+        waveform so every queue item starts from a clean trigger state.
+        """
+
+        if self.iqr is None:
+            raise RuntimeError("IQW/IQR记录仪尚未连接。")
+        with self._iqr_lock:
+            self.iqr.write("TRIGger:PLAYer:STOP")
+            self.iqr.write("TRIGger:PLAYer:ARM OFF")
+            state = self._wait_iqr_player_disarmed(timeout_s=timeout_s)
+            self._iqr_paused = False
+        self.logger(f"IQR Player已停止并解除武装，可切换记录：{state}。")
+        return state
+
     @staticmethod
     def _parse_iqr_player_state(response: object) -> str:
         """Return the readable state from an IQR SCPI string response.
@@ -737,39 +780,44 @@ class VisaPlaybackSession:
             raise RuntimeError("IQW/IQR记录仪尚未连接。")
         normalized_path = normalize_iqr_waveform_path(waveform_path)
         escaped = normalized_path.replace("'", "''")
-        self.iqr.write("INSTrument:SELect:MODE PLAYer")
-        self.iqr.write("INSTrument:SELect:TYPE STReam")
-        active_display_mode = self.set_iqr_player_display_mode(display_mode)
-        self.iqr.write(
-            "SYSTem:REFerence:FREQuency:SOURce "
-            + ("EXTernal" if external_10mhz_reference else "INTernal")
-        )
-        self.iqr.write("INPut:CLOCk:SOURce INTernal")
-        self.iqr.write(f"OUTPut:PLAYer:WAVeform:SELect '{escaped}'")
-        load_state = self._wait_iqr_player_ready()
-        try:
-            destination = str(
-                self.iqr.query("OUTPut:SYSTem:INSTrument:DESTination:IDENtification?")
-            ).strip()
-        except Exception as exc:
-            destination = f"未查询到（{exc}）"
-        destination_status = str(
-            self.iqr.query("OUTPut1:SYSTem:INSTrument:DESTination:STATus?")
-        ).strip()
-        if destination_status.upper() not in ("1", "ON"):
-            raise RuntimeError(
-                "IQR100未检测到数字IQ输出目标。请检查IQR DIGITAL IQ OUT到"
-                f"SMBV BASEBAND DIGITAL IN的26针连接线；设备回读{destination_status}。"
+        # A scene queue loads a different native recording after every SINGle
+        # cycle.  STOP alone does not reliably clear the 04.10.x trigger latch;
+        # finish a real OFF -> ON arm cycle around every waveform selection.
+        self.reset_iqr_player_for_recording_switch()
+        with self._iqr_lock:
+            self.iqr.write("INSTrument:SELect:MODE PLAYer")
+            self.iqr.write("INSTrument:SELect:TYPE STReam")
+            active_display_mode = self.set_iqr_player_display_mode(display_mode)
+            self.iqr.write(
+                "SYSTem:REFerence:FREQuency:SOURce "
+                + ("EXTernal" if external_10mhz_reference else "INTernal")
             )
-        self.iqr.write("TRIGger:PLAYer:SYNC SALone")
-        active_run_mode = self.set_iqr_player_run_mode(continuous)
-        self.iqr.write("TRIGger:PLAYer:SOURce LAN")
-        self.iqr.write("TRIGger:PLAYer:ARM ON")
-        state = self._wait_iqr_player_armed_for_lan()
-        error = str(self.iqr.query("SYSTem:ERRor?")).strip()
-        if not scpi_error_is_clear(error):
-            raise RuntimeError(f"IQR记录加载失败：{error}")
-        self._iqr_paused = False
+            self.iqr.write("INPut:CLOCk:SOURce INTernal")
+            self.iqr.write(f"OUTPut:PLAYer:WAVeform:SELect '{escaped}'")
+            load_state = self._wait_iqr_player_ready()
+            try:
+                destination = str(
+                    self.iqr.query("OUTPut:SYSTem:INSTrument:DESTination:IDENtification?")
+                ).strip()
+            except Exception as exc:
+                destination = f"未查询到（{exc}）"
+            destination_status = str(
+                self.iqr.query("OUTPut1:SYSTem:INSTrument:DESTination:STATus?")
+            ).strip()
+            if destination_status.upper() not in ("1", "ON"):
+                raise RuntimeError(
+                    "IQR100未检测到数字IQ输出目标。请检查IQR DIGITAL IQ OUT到"
+                    f"SMBV BASEBAND DIGITAL IN的26针连接线；设备回读{destination_status}。"
+                )
+            self.iqr.write("TRIGger:PLAYer:SYNC SALone")
+            active_run_mode = self.set_iqr_player_run_mode(continuous)
+            self.iqr.write("TRIGger:PLAYer:SOURce LAN")
+            self.iqr.write("TRIGger:PLAYer:ARM ON")
+            state = self._wait_iqr_player_armed_for_lan()
+            error = str(self.iqr.query("SYSTem:ERRor?")).strip()
+            if not scpi_error_is_clear(error):
+                raise RuntimeError(f"IQR记录加载失败：{error}")
+            self._iqr_paused = False
         self.logger(
             f"IQR记录已装载：{normalized_path}｜加载状态：{load_state}｜"
             f"目标设备：{destination}（连接{destination_status}）｜采样时钟：Internal｜"
@@ -786,7 +834,9 @@ class VisaPlaybackSession:
             if self.iqr is None:
                 raise RuntimeError("IQW/IQR记录仪尚未连接。")
             with self._iqr_lock:
-                self.set_iqr_player_display_mode(iqr_display_mode)
+                normalized_display_mode = iqr_display_mode.strip().upper()
+                if normalized_display_mode != self._iqr_display_mode:
+                    self.set_iqr_player_display_mode(normalized_display_mode)
                 if self._iqr_paused:
                     self.iqr.write("TRIGger:PLAYer:STARt")
                 else:
