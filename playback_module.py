@@ -2490,7 +2490,11 @@ class PlaybackModule(ttk.Frame):
             )
             if cancel_event.is_set():
                 return
-            session.start(use_iqr=True, iqr_display_mode=settings.iqr_display_mode)
+            link_status, trigger_retried = session.start_iqr_with_stream_confirmation(
+                iqr_display_mode=settings.iqr_display_mode,
+                stream_timeout_s=3.0,
+                retry_delay_s=0.8,
+            )
             if cancel_event.is_set():
                 session.stop(use_iqr=True)
                 return
@@ -2502,8 +2506,12 @@ class PlaybackModule(ttk.Frame):
                     (
                         request_id,
                         smw_status,
-                        f"{iqr_status}｜LAN触发命令已发送｜"
-                        "设备执行期间暂停IQR状态轮询，避免固件VISA超时",
+                        f"{iqr_status}｜实际数据流已确认：{link_status}｜"
+                        + (
+                            "LAN触发首次丢失，重发后成功"
+                            if trigger_retried
+                            else "LAN触发首次成功"
+                        ),
                         restore_rf,
                     ),
                 )

@@ -49,6 +49,39 @@ class LatchingIQR:
         raise AssertionError(f"unexpected query: {command}")
 
 
+class RetryIQR(LatchingIQR):
+    """Drops the first EXECute event, matching the observed queue transition."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.execute_count = 0
+
+    def write(self, command: str) -> None:
+        if command == "TRIGger:PLAYer:EXECute":
+            self.commands.append(command)
+            self.execute_count += 1
+            if self.execute_count >= 2:
+                self.state = "Running"
+            return
+        super().write(command)
+
+
+class LinkedSMBV:
+    def __init__(self, iqr: LatchingIQR) -> None:
+        self.iqr = iqr
+
+    def query(self, command: str) -> str:
+        if command == "SOURce1:BBIN:SRATe:SOURce?":
+            return "DIN"
+        if command == "SOURce1:BBIN:STATe?":
+            return "1"
+        if command == "SOURce1:BBIN:SRATe:FIFO:STATus?":
+            return "OK" if self.iqr.state == "Running" else "URUN"
+        if command == "SOURce1:BBIN:CDEVice?":
+            return "IQR100"
+        raise AssertionError(f"unexpected SMBV query: {command}")
+
+
 class IQRTriggerResetTests(unittest.TestCase):
     def test_loading_next_recording_resets_stale_arm_latch_before_rearming(self) -> None:
         session = VisaPlaybackSession()
@@ -91,6 +124,23 @@ class IQRTriggerResetTests(unittest.TestCase):
         self.assertEqual(iqr.commands.count("TRIGger:PLAYer:ARM OFF"), 3)
         self.assertEqual(iqr.commands.count("TRIGger:PLAYer:ARM ON"), 3)
         self.assertEqual(iqr.commands.count("TRIGger:PLAYer:EXECute"), 3)
+
+    def test_lost_lan_trigger_is_retried_and_requires_real_smbv_stream(self) -> None:
+        session = VisaPlaybackSession()
+        iqr = RetryIQR()
+        session.iqr = iqr
+        session.smw = LinkedSMBV(iqr)
+
+        session.load_iqr_recording("e:/second", continuous=False)
+        link_status, retried = session.start_iqr_with_stream_confirmation(
+            stream_timeout_s=0.01,
+            retry_delay_s=0.0,
+        )
+
+        self.assertTrue(retried)
+        self.assertEqual(iqr.execute_count, 2)
+        self.assertEqual(iqr.state, "Running")
+        self.assertIn("FIFO OK", link_status)
 
 
 if __name__ == "__main__":

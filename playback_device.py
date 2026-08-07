@@ -520,13 +520,24 @@ class VisaPlaybackSession:
             time.sleep(0.2)
         raise TimeoutError(f"IQR加载记录超时，最后状态：{state or '无响应'}")
 
-    def _wait_iqr_player_armed_for_lan(self, timeout_s: float = 15.0) -> str:
-        """Wait until ARM ON has actually reached the LAN-trigger wait state."""
+    def _wait_iqr_player_armed_for_lan(
+        self,
+        timeout_s: float = 15.0,
+        stable_s: float = 0.6,
+    ) -> str:
+        """Wait until the LAN-trigger state remains stable before EXECute.
+
+        Firmware 04.10.x can expose the LAN wait text shortly before its command
+        loop is ready to consume an EXECute event.  Requiring a stable interval
+        prevents an automatic scene transition from triggering much faster than
+        a human-operated first replay.
+        """
 
         assert self.iqr is not None
         deadline = time.monotonic() + timeout_s
         state = ""
         previous_state = ""
+        lan_wait_started_at: float | None = None
         while time.monotonic() < deadline:
             state = self.query_iqr_player_state()
             if state != previous_state:
@@ -534,7 +545,12 @@ class VisaPlaybackSession:
                 previous_state = state
             normalized = " ".join(state.casefold().split())
             if normalized.startswith("waiting for lan remote trigger"):
-                return state
+                if lan_wait_started_at is None:
+                    lan_wait_started_at = time.monotonic()
+                if time.monotonic() - lan_wait_started_at >= max(0.0, stable_s):
+                    return state
+            else:
+                lan_wait_started_at = None
             if "error" in normalized or "failed" in normalized:
                 raise RuntimeError(f"IQR Player重新武装失败，设备状态：{state}")
             time.sleep(0.1)
@@ -858,6 +874,59 @@ class VisaPlaybackSession:
                     self.iqr.write("TRIGger:PLAYer:EXECute")
                 self._iqr_paused = False
         self.logger("回放已启动；RF是否打开由独立安全联锁控制。")
+
+    def start_iqr_with_stream_confirmation(
+        self,
+        iqr_display_mode: str = "IQ",
+        stream_timeout_s: float = 3.0,
+        retry_delay_s: float = 0.8,
+    ) -> tuple[str, bool]:
+        """Trigger IQR and require actual digital-IQ data at the SMBV input.
+
+        IQR state queries can block while native data is replaying, so the
+        positive start acknowledgement comes from the SMBV digital-input FIFO.
+        If no stream arrives and IQR still answers that it is waiting for LAN,
+        the first event was lost; resend EXECute once after a settling delay.
+        """
+
+        self.start(use_iqr=True, iqr_display_mode=iqr_display_mode)
+        try:
+            return self.verify_smw_digital_iq_stream(timeout_s=stream_timeout_s), False
+        except Exception as first_error:
+            state = self.query_iqr_player_state()
+            normalized = " ".join(state.casefold().split())
+            if not normalized.startswith("waiting for lan remote trigger"):
+                raise RuntimeError(
+                    f"IQR触发后未确认到数字IQ数据流；Player状态：{state or '无响应'}；"
+                    f"SMBV100A：{first_error}"
+                ) from first_error
+
+            self.logger(
+                "IQR仍在等待LAN触发，首次EXECute未生效；"
+                f"等待{max(0.0, retry_delay_s):g} s后重发一次。"
+            )
+            if retry_delay_s > 0:
+                time.sleep(retry_delay_s)
+            self.start(use_iqr=True, iqr_display_mode=iqr_display_mode)
+            try:
+                link_status = self.verify_smw_digital_iq_stream(
+                    timeout_s=stream_timeout_s
+                )
+            except Exception as retry_error:
+                retry_state = self.query_iqr_player_state()
+                error_text = ""
+                try:
+                    assert self.iqr is not None
+                    error_text = str(self.iqr.query("SYSTem:ERRor?")).strip()
+                except Exception:
+                    pass
+                detail = f"；IQR错误：{error_text}" if error_text else ""
+                raise RuntimeError(
+                    "IQR LAN触发重试后仍没有实际数字IQ数据流；"
+                    f"Player状态：{retry_state or '无响应'}；SMBV100A：{retry_error}{detail}"
+                ) from retry_error
+            self.logger("IQR LAN触发重试成功，SMBV100A数字IQ FIFO已收到数据。")
+            return link_status, True
 
     def pause(self, use_iqr: bool = False) -> None:
         if use_iqr and self.iqr is not None:
