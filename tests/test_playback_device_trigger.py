@@ -50,7 +50,7 @@ class LatchingIQR:
 
 
 class RetryIQR(LatchingIQR):
-    """Drops the first EXECute event, matching the observed queue transition."""
+    """Drops EXECute but accepts STARt, matching the observed second file."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -60,26 +60,12 @@ class RetryIQR(LatchingIQR):
         if command == "TRIGger:PLAYer:EXECute":
             self.commands.append(command)
             self.execute_count += 1
-            if self.execute_count >= 2:
-                self.state = "Running"
+            return
+        if command == "TRIGger:PLAYer:STARt":
+            self.commands.append(command)
+            self.state = "Running"
             return
         super().write(command)
-
-
-class LinkedSMBV:
-    def __init__(self, iqr: LatchingIQR) -> None:
-        self.iqr = iqr
-
-    def query(self, command: str) -> str:
-        if command == "SOURce1:BBIN:SRATe:SOURce?":
-            return "DIN"
-        if command == "SOURce1:BBIN:STATe?":
-            return "1"
-        if command == "SOURce1:BBIN:SRATe:FIFO:STATus?":
-            return "OK" if self.iqr.state == "Running" else "URUN"
-        if command == "SOURce1:BBIN:CDEVice?":
-            return "IQR100"
-        raise AssertionError(f"unexpected SMBV query: {command}")
 
 
 class IQRTriggerResetTests(unittest.TestCase):
@@ -125,22 +111,22 @@ class IQRTriggerResetTests(unittest.TestCase):
         self.assertEqual(iqr.commands.count("TRIGger:PLAYer:ARM ON"), 3)
         self.assertEqual(iqr.commands.count("TRIGger:PLAYer:EXECute"), 3)
 
-    def test_lost_lan_trigger_is_retried_and_requires_real_smbv_stream(self) -> None:
+    def test_lost_execute_uses_start_fallback_and_confirms_iqr_running(self) -> None:
         session = VisaPlaybackSession()
         iqr = RetryIQR()
         session.iqr = iqr
-        session.smw = LinkedSMBV(iqr)
 
         session.load_iqr_recording("e:/second", continuous=False)
-        link_status, retried = session.start_iqr_with_stream_confirmation(
-            stream_timeout_s=0.01,
-            retry_delay_s=0.0,
+        player_state, trigger_method = session.start_iqr_with_state_confirmation(
+            execute_timeout_s=0.01,
+            fallback_timeout_s=0.1,
         )
 
-        self.assertTrue(retried)
-        self.assertEqual(iqr.execute_count, 2)
+        self.assertEqual(player_state, "Running")
+        self.assertIn("STARt", trigger_method)
+        self.assertEqual(iqr.execute_count, 1)
         self.assertEqual(iqr.state, "Running")
-        self.assertIn("FIFO OK", link_status)
+        self.assertIn("TRIGger:PLAYer:STARt", iqr.commands)
 
 
 if __name__ == "__main__":

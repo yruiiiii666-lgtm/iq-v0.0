@@ -1995,10 +1995,20 @@ class PlaybackModule(ttk.Frame):
                 raise RuntimeError(
                     f"循环设置未与IQR100同步：软件要求{expected_text}，设备回读{run_mode}。"
                 )
-            session.start(use_iqr=True, iqr_display_mode=display_mode)
+            player_state, trigger_method = session.start_iqr_with_state_confirmation(
+                iqr_display_mode=display_mode,
+                execute_timeout_s=2.0,
+                fallback_timeout_s=5.0,
+            )
             if cancel_event.is_set():
                 session.stop(use_iqr=True)
                 return
+            self.messages.put(
+                (
+                    "log",
+                    f"IQR100启动状态已查询确认：{player_state}｜启动命令：{trigger_method}",
+                )
+            )
             self.messages.put(
                 (
                     "playback_triggered",
@@ -2490,10 +2500,10 @@ class PlaybackModule(ttk.Frame):
             )
             if cancel_event.is_set():
                 return
-            link_status, trigger_retried = session.start_iqr_with_stream_confirmation(
+            player_state, trigger_method = session.start_iqr_with_state_confirmation(
                 iqr_display_mode=settings.iqr_display_mode,
-                stream_timeout_s=3.0,
-                retry_delay_s=0.8,
+                execute_timeout_s=2.0,
+                fallback_timeout_s=5.0,
             )
             if cancel_event.is_set():
                 session.stop(use_iqr=True)
@@ -2506,12 +2516,8 @@ class PlaybackModule(ttk.Frame):
                     (
                         request_id,
                         smw_status,
-                        f"{iqr_status}｜实际数据流已确认：{link_status}｜"
-                        + (
-                            "LAN触发首次丢失，重发后成功"
-                            if trigger_retried
-                            else "LAN触发首次成功"
-                        ),
+                        f"{iqr_status}｜Player状态已确认：{player_state}｜"
+                        f"启动命令：{trigger_method}",
                         restore_rf,
                     ),
                 )
