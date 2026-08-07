@@ -141,6 +141,7 @@ class PlaybackModule(ttk.Frame):
         self.raw_recording_map: dict[str, IQRecording] = {}
         self.raw_sequence: list[tuple[IQRecording, str]] = []
         self.raw_sequence_index = -1
+        self.raw_sequence_finished = False
         self.output_source_var = tk.StringVar(value="未选择")
         self.output_center_var = tk.StringVar(value="--")
         self.output_sample_rate_var = tk.StringVar(value="--")
@@ -648,7 +649,13 @@ class PlaybackModule(ttk.Frame):
         )
         self.raw_sequence.clear()
         self.raw_sequence_index = -1
+        self.raw_sequence_finished = False
         if sequence_mode:
+            # A scene batch is always a finite one-pass queue.  Do not inherit
+            # a previous single-waveform CONTinuous setting and wrap back to
+            # the first IQ after the completion message.
+            self.loop_enabled_var.set(False)
+            self.run_mode_var.set("单次")
             count = 0
             for location in self.raw_location_map.values():
                 count += len(list_linked_iq_details(
@@ -661,6 +668,11 @@ class PlaybackModule(ttk.Frame):
             self._update_raw_selection_text()
 
     def _on_loop_toggled(self) -> None:
+        if self._is_raw_sequence_mode() and self.loop_enabled_var.get():
+            self.loop_enabled_var.set(False)
+            self.run_mode_var.set("单次")
+            self.status_var.set("场景全部IQ固定为单次顺序回放；最后一条完成后自动停止。")
+            return
         self.run_mode_var.set("连续" if self.loop_enabled_var.get() else "单次")
         if self._is_raw_sequence_mode():
             meaning = (
@@ -1206,6 +1218,7 @@ class PlaybackModule(ttk.Frame):
         self.raw_recording = None
         self.raw_sequence.clear()
         self.raw_sequence_index = -1
+        self.raw_sequence_finished = False
         self.hardware_playback_active = False
         self.sequence_transitioning = False
         self._update_output_source_fields(None)
@@ -1255,10 +1268,12 @@ class PlaybackModule(ttk.Frame):
                 if not self.raw_sequence:
                     raise ValueError(f"{self.raw_scene_var.get()}没有可读取的IQ数据")
                 self.raw_sequence_index = 0
+                self.raw_sequence_finished = False
                 recording, scene_context = self.raw_sequence[0]
             else:
                 self.raw_sequence.clear()
                 self.raw_sequence_index = -1
+                self.raw_sequence_finished = False
                 recording = self._selected_raw_recording()
                 location = self.raw_location_map.get(self.raw_location_var.get())
                 if recording is not None and location is not None:
@@ -2335,6 +2350,11 @@ class PlaybackModule(ttk.Frame):
         self.draw_preview()
 
     def _advance_preview(self) -> None:
+        if self.raw_sequence_finished:
+            self.playing = False
+            self.preview_clock_started_at = None
+            self.play_after_id = None
+            return
         if not self.playing or self.current_result is None:
             self.play_after_id = None
             return
@@ -2371,37 +2391,45 @@ class PlaybackModule(ttk.Frame):
         self.play_after_id = self.after(100, self._advance_preview)
 
     def _advance_raw_sequence(self) -> None:
-        if self.sequence_transitioning or not self.raw_sequence:
+        if self.raw_sequence_finished or self.sequence_transitioning or not self.raw_sequence:
             return
         next_index = self.raw_sequence_index + 1
         if next_index >= len(self.raw_sequence):
-            if self.loop_enabled_var.get():
-                next_index = 0
-            else:
-                if (
-                    self.hardware_playback_active and self.rf_enabled and self.session is not None
-                    and not self.simulation_var.get()
-                ):
-                    try:
-                        self.session.set_rf(False)
-                    except Exception as exc:
-                        self._log(f"场景顺序结束时关闭RF失败：{exc}")
-                        self._set_rf_unknown()
-                    else:
-                        self._apply_rf_state(False, source="sequence")
-                self.playing = False
-                self.hardware_playback_active = False
-                self.preview_clock_started_at = None
-                self.play_button.configure(text="重新预览")
-                self._require_new_device_configuration()
-                message = (
-                    f"{self.raw_scene_var.get()}场景全部{len(self.raw_sequence)}条IQ已依次回放完成；"
-                    "请重新发送波形并配置设备。"
-                )
-                self.play_status_var.set(message)
-                self.status_var.set(message)
-                self._log(message)
-                return
+            # Set the terminal latch before doing any UI/RF cleanup.  Delayed
+            # Tk callbacks and stale worker messages must see completion and
+            # must never query, reload or trigger IQR again.
+            self.raw_sequence_finished = True
+            self.sequence_transitioning = False
+            self.playing = False
+            self.hardware_playback_active = False
+            self.preview_clock_started_at = None
+            if self.play_after_id is not None:
+                try:
+                    self.after_cancel(self.play_after_id)
+                except tk.TclError:
+                    pass
+                self.play_after_id = None
+            self._cancel_playback_operation()
+            if self.rf_enabled and self.session is not None and not self.simulation_var.get():
+                try:
+                    self.session.set_rf(False)
+                except Exception as exc:
+                    self._log(f"场景顺序结束时关闭RF失败：{exc}")
+                    self._set_rf_unknown()
+                else:
+                    self._apply_rf_state(False, source="sequence")
+            self.play_button.configure(text="重新预览")
+            self._require_new_device_configuration()
+            message = (
+                f"{self.raw_scene_var.get()}场景全部{len(self.raw_sequence)}条IQ已依次回放完成；"
+                "队列已结束，不再读取或访问IQR100。"
+            )
+            self.device_status_var.set(message)
+            self.play_status_var.set(message)
+            self.status_var.set(message)
+            self._log(message)
+            messagebox.showinfo("场景顺序回放完成", message)
+            return
 
         hardware_active = self.hardware_playback_active
         self.sequence_transitioning = True
@@ -3005,7 +3033,7 @@ class PlaybackModule(ttk.Frame):
                 self.device_status_var.set(str(error_text))
             elif kind == "sequence_started":
                 request_id, smw_status, iqr_status, restored_rf = payload  # type: ignore[misc]
-                if request_id != self.playback_request_id:
+                if self.raw_sequence_finished or request_id != self.playback_request_id:
                     continue
                 self.start_transitioning = False
                 self.sequence_transitioning = False
@@ -3022,7 +3050,7 @@ class PlaybackModule(ttk.Frame):
                 self._advance_preview()
             elif kind == "sequence_error":
                 request_id, error_text = payload  # type: ignore[misc]
-                if request_id != self.playback_request_id:
+                if self.raw_sequence_finished or request_id != self.playback_request_id:
                     continue
                 self.start_transitioning = False
                 self.sequence_transitioning = False
